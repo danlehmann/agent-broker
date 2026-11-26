@@ -16,7 +16,7 @@ use std::time::Instant;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
-use crate::db::{AuditEntry, now};
+use crate::db::{AuditEntry, hash_secret, now, random_base32};
 use crate::dispatch::{Broker, log};
 use crate::error::{Error, Result, refuse};
 use crate::github::{TOOLS, rules};
@@ -83,6 +83,8 @@ pub struct Web {
     cost: Cost,
     delays: Delays,
     audited_failures: Mutex<(Instant, u32)>,
+    /// The hash of the link token for creating the first admin, while there is no user.
+    first_run: Mutex<Option<Vec<u8>>>,
 }
 
 /// A request that came with a valid session.
@@ -121,7 +123,60 @@ impl Ctx<'_> {
 
 impl Web {
     pub fn new(broker: Arc<Broker>, cost: Cost) -> Web {
-        Web { broker, cost, delays: Delays::default(), audited_failures: Mutex::new((Instant::now(), 0)) }
+        Web {
+            broker,
+            cost,
+            delays: Delays::default(),
+            audited_failures: Mutex::new((Instant::now(), 0)),
+            first_run: Mutex::default(),
+        }
+    }
+
+    /// While there is no user at all: a new link path where the first admin is created. Anyone
+    /// on the machine can reach the web UI, so only who can read this may set it up. The link
+    /// works once, and until this is called again.
+    pub fn first_run_link(&self) -> Result<Option<String>> {
+        if !self.broker.db.users()?.is_empty() {
+            return Ok(None);
+        }
+        let token = random_base32(52);
+        *self.first_run.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash_secret(&token));
+        Ok(Some(format!("/setup/{token}")))
+    }
+
+    /// Creates the first admin, if `token` is the one for it.
+    fn first_admin(&self, req: &Req, token: &str) -> Result<Option<Resp>> {
+        // Held to the end, so that two requests cannot both create one.
+        let mut first_run = self.first_run.lock().unwrap_or_else(|e| e.into_inner());
+        let fits = first_run.as_ref().is_some_and(|hash| auth::same(hash, &hash_secret(token)));
+        if !fits {
+            return Ok(None);
+        }
+        let db = &self.broker.db;
+        if !db.users()?.is_empty() {
+            *first_run = None;
+            return Ok(None);
+        }
+        let name = field(&req.form, "username").unwrap_or_default().trim();
+        if req.method != "POST" {
+            return Ok(Some(Resp::page(pages::setup(token, None, None))));
+        }
+        let new = field(&req.form, "new").unwrap_or_default();
+        let problem = match (check_username(name), field(&req.form, "again") == Some(new)) {
+            (Err(e), _) => Some(e.public().to_string()),
+            (Ok(()), false) => Some("the two entries differ".to_string()),
+            (Ok(()), true) => check_new_password(new).err(),
+        };
+        if let Some(problem) = problem {
+            return Ok(Some(Resp::page(pages::setup(token, None, Some((name, &problem))))));
+        }
+        let hash = hash_password(new, self.cost).ok_or_else(|| Error::Internal("hashing failed".into()))?;
+        let id = db.add_user(name, true)?;
+        db.set_password(id, &hash, None)?;
+        *first_run = None;
+        self.audit(Some(name), "first admin created", true, None, "");
+        let done = "You are the first admin. Log in with the name and password you chose.";
+        Ok(Some(Resp::redirect(format!("/?ok={}", http::encode(done)))))
     }
 
     /// Answers one request. Failures inside become a plain error page.
@@ -217,12 +272,15 @@ impl Web {
 
     /// Setting a password through a one-time link.
     fn setup(&self, req: &Req, token: &str) -> Result<Resp> {
+        if let Some(resp) = self.first_admin(req, token)? {
+            return Ok(resp);
+        }
         let db = &self.broker.db;
         let Some(user) = db.one_time_link(token)? else {
             return Ok(Resp::error(404, "This link is used up or too old. Ask for a new one."));
         };
         if req.method != "POST" {
-            return Ok(Resp::page(pages::setup(token, &user.username, None)));
+            return Ok(Resp::page(pages::setup(token, Some(&user.username), None)));
         }
         let new = field(&req.form, "new").unwrap_or_default();
         let problem = match field(&req.form, "again") == Some(new) {
@@ -230,7 +288,7 @@ impl Web {
             false => Some("the two entries differ".to_string()),
         };
         if let Some(problem) = problem {
-            return Ok(Resp::page(pages::setup(token, &user.username, Some(&problem))));
+            return Ok(Resp::page(pages::setup(token, Some(&user.username), Some(("", &problem)))));
         }
         let hash = hash_password(new, self.cost).ok_or_else(|| Error::Internal("hashing failed".into()))?;
         if db.use_one_time_link(token, &hash)?.is_none() {

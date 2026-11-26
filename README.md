@@ -26,17 +26,16 @@ socket), authenticator-app codes for logging in, and a build on macOS.
 ## Setting up
 
 1. Start the daemon under its own account (see `docs/manual-test.md`).
-2. As that account, run `agent-broker init`. It asks for the name of the first admin and prints
-   a one-time link, with the line for `~/.ssh/config` that forwards the web interface to your
-   machine.
-3. Open the link, set a password, log in.
-4. Under **Repos**, add a repo with a fine-grained token and a branch prefix.
-5. Under **Linked accounts**, get a link code, run `agent-broker link` as the agent's unix
+2. On its first start it writes a one-time link to its log, with the line for `~/.ssh/config`
+   that forwards the web interface to your machine. Open the link and create the first admin.
+   Whoever can read that log can do this, so agent accounts must not be able to.
+3. Under **Repos**, add a repo with a fine-grained token and a branch prefix.
+4. Under **Linked accounts**, get a link code, run `agent-broker link` as the agent's unix
    account, type the code, and confirm on the page.
-6. Give the agent's harness the MCP server `{"command": "agent-broker", "args": ["mcp"]}`.
+5. Give the agent's harness the MCP server `{"command": "agent-broker", "args": ["mcp"]}`.
 
 If you are locked out, `agent-broker reset-login USERNAME`, run as the daemon's account, prints
-a new one-time link.
+a one-time link to set a new password.
 
 ## Layout
 

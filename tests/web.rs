@@ -152,6 +152,41 @@ fn a_password_is_set_through_a_link_that_works_once() {
 }
 
 #[test]
+fn a_fresh_install_is_set_up_through_the_link_the_daemon_prints() {
+    let s = Site::new();
+    // With users around there is no such link.
+    assert_eq!(s.web.first_run_link().unwrap(), None);
+    s.w.broker.db.conn().execute("DELETE FROM users", []).unwrap();
+    let old = s.web.first_run_link().unwrap().unwrap();
+    let link = s.web.first_run_link().unwrap().unwrap();
+    // Only the newest link works; a guess does not.
+    assert_eq!(s.request("GET", &old, "", &[]).status, 404);
+    assert_eq!(s.request("GET", "/setup/", "", &[]).status, 404);
+    let page = s.request("GET", &link, "", &[]).body;
+    assert!(page.contains("There is no user yet") && page.contains("name=\"username\""));
+    let create = |name: &str, new: &str, again: &str| {
+        s.request("POST", &link, "", &[("username", name), ("new", new), ("again", again)])
+    };
+    assert!(create("Not A Name", PASSWORD, PASSWORD).body.contains("A username starts with"));
+    assert!(create("dana", PASSWORD, "something else").body.contains("the two entries differ"));
+    assert!(create("dana", "short", "short").body.contains("at least 12 characters"));
+    assert!(create("dana", "short", "short").body.contains("name=\"username\" value=\"dana\""));
+    assert!(s.w.broker.db.users().unwrap().is_empty(), "nothing was created by those");
+    assert_eq!(create("dana", PASSWORD, PASSWORD).status, 303);
+    // She is an admin and can log in; the link is used up, also for a second admin.
+    let dana = s.login("dana", PASSWORD);
+    assert_eq!(s.get(&dana, "users").status, 200);
+    assert_eq!(s.request("GET", &link, "", &[]).status, 404);
+    assert_eq!(create("eve", PASSWORD, PASSWORD).status, 404);
+    assert_eq!(s.w.broker.db.users().unwrap().len(), 1);
+    assert_eq!(s.web.first_run_link().unwrap(), None);
+    let audit = s.audit();
+    assert!(
+        audit.contains("first admin created") && !audit.contains(&link[7..]) && !audit.contains(PASSWORD)
+    );
+}
+
+#[test]
 fn login_takes_the_right_password_and_slows_guessing() {
     let s = Site::new();
     s.set_password("alice", PASSWORD);

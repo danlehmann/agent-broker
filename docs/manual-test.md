@@ -19,12 +19,10 @@ sudo install -d -o BROKER -m 755 /run/agent-broker
 
 b() { sudo -u BROKER -H agent-broker "$@"; }
 b daemon                                                           # leave running
-b init                                                             # in another terminal
 ```
 
-`init` asks for the name of the first admin (`YOU`) and prints a one-time link and the line
-that forwards the web interface. Open the link, set a password and log in. Then, in the
-browser:
+On its first start the daemon prints a one-time link and the line that forwards the web
+interface. Open the link, create the first admin (`YOU`) and log in. Then, in the browser:
 
 - **Repos:** add `OWNER/NAME` with the token and the branch prefix `YOU/`.
 - **Linked accounts:** get a link code, run `sudo -u A -H agent-broker link`, type the code,

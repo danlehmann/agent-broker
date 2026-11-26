@@ -15,7 +15,6 @@ const USAGE: &str = "usage:
   agent-broker daemon [--data-dir DIR] [--run-dir DIR]
   agent-broker mcp [--run-dir DIR]
   agent-broker link [--run-dir DIR]
-  agent-broker init [--data-dir DIR] [--run-dir DIR]
   agent-broker reset-login USERNAME [--data-dir DIR] [--run-dir DIR]
 ";
 
@@ -98,16 +97,11 @@ fn dispatch(args: &[String]) -> Outcome {
             let flags = Flags::parse(rest, &["run-dir"])?;
             link(&flags.run_dir().join("agent.sock"))
         }
-        "init" => {
-            let flags = Flags::parse(rest, &["data-dir", "run-dir"])?;
-            close_off();
-            login_link(&flags, None)
-        }
         "reset-login" => {
             let (username, rest) = rest.split_first().ok_or(USAGE)?;
             let flags = Flags::parse(rest, &["data-dir", "run-dir"])?;
             close_off();
-            login_link(&flags, Some(username))
+            reset_login(&flags, username)
         }
         _ => Err(USAGE.into()),
     }
@@ -122,38 +116,20 @@ fn close_off() {
     }
 }
 
-/// Makes a one-time link to set a password: for a new first admin (`init`), or for an existing
-/// user. Run by the human through sudo, which is what makes it the way in and the way back in.
-fn login_link(flags: &Flags, existing: Option<&str>) -> Outcome {
+/// Makes a one-time link to set a user's password. Run by the human through sudo, which is
+/// what makes it the way back in.
+fn reset_login(flags: &Flags, username: &str) -> Outcome {
     daemon::check_not_root()?;
     let data = flags.data_dir()?;
-    daemon::create_private_dir(&data).map_err(|e| e.to_string())?;
     daemon::check_data_dir(&data)?;
     let db = Db::open(&data.join("broker.db")).map_err(|e| e.to_string())?;
     let fail = |e: crate::error::Error| e.to_string();
-    let (user, purpose) = match existing {
-        Some(name) => (db.user_id(name).map_err(fail)?.ok_or("no such user")?, "reset"),
-        None => {
-            if !db.users().map_err(fail)?.is_empty() {
-                return Err("there are users already; use reset-login USERNAME to get back in".into());
-            }
-            print!("username of the first admin: ");
-            std::io::stdout().flush().map_err(|e| e.to_string())?;
-            let mut name = String::new();
-            std::io::stdin().lock().read_line(&mut name).map_err(|e| e.to_string())?;
-            crate::web::check_username(name.trim()).map_err(|e| e.public().to_string())?;
-            (db.add_user(name.trim(), true).map_err(fail)?, "setup")
-        }
-    };
-    let token = db.new_one_time_link(user, purpose).map_err(fail)?;
-    let socket = flags.run_dir().join("admin.sock");
+    let user = db.user_id(username).map_err(fail)?.ok_or("no such user")?;
+    let token = db.new_one_time_link(user, "reset").map_err(fail)?;
     println!(
-        "The web UI is served on {socket}. To reach it from your own machine, forward a port to it,\n\
-         for example with this line for the host in ~/.ssh/config:\n\n    \
-         LocalForward 8443 {socket}\n\n\
-         Then open this link within 15 minutes and set the password. It works once:\n\n    \
+        "{}\nOpen this link within 15 minutes and set the password. It works once:\n\n    \
          http://localhost:8443/setup/{token}\n",
-        socket = socket.display()
+        daemon::how_to_reach(&flags.run_dir().join("admin.sock"))
     );
     Ok(())
 }

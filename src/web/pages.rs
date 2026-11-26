@@ -385,17 +385,30 @@ pub fn login(ok: Option<&str>, err: Option<&str>) -> String {
     document("Log in", "", &body)
 }
 
-pub fn setup(token: &str, username: &str, err: Option<&str>) -> String {
+/// The page behind a one-time link: setting the password of `user`, or, without one, creating
+/// the first admin. `err` is a name that was typed and what was wrong.
+pub fn setup(token: &str, user: Option<&str>, err: Option<(&str, &str)>) -> String {
+    let (title, name) = match user {
+        Some(user) => (format!("Set the password of {user}"), String::new()),
+        None => (
+            "Set up agent-broker".to_string(),
+            format!(
+                "<p>There is no user yet. The one you create here is the first admin.</p>\
+                 <label>Username</label><input type=\"text\" name=\"username\" value=\"{}\" required autofocus>",
+                esc(err.map_or("", |(typed, _)| typed))
+            ),
+        ),
+    };
     let body = format!(
-        "<h1>Set the password of {}</h1>{}<section><form method=\"post\" action=\"/setup/{}\">\
-         <label>New password (at least 12 characters)</label><input type=\"password\" name=\"new\" required autofocus>\
+        "<h1>{}</h1>{}<section><form method=\"post\" action=\"/setup/{}\">{name}\
+         <label>New password (at least 12 characters)</label><input type=\"password\" name=\"new\" required>\
          <label>New password again</label><input type=\"password\" name=\"again\" required>\
          <br><button>Set password</button></form></section>",
-        esc(username),
-        notices(None, err),
+        esc(&title),
+        notices(None, err.map(|(_, problem)| problem)),
         esc(token)
     );
-    document("Set password", "", &body)
+    document(&title, "", &body)
 }
 
 pub fn plain(title: &str, text: &str) -> String {
