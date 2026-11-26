@@ -32,7 +32,7 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "github_push",
-        description: "Push a local branch to GitHub. `workspace` is the absolute path of the checkout that has the branch; commit first. Only branches starting with the repo's branch prefix (see `github_repos`). A rewritten history needs force=true and only works for branches first pushed through this tool, and only while they still continue what was pushed through it: not after someone else re-created, rewrote or merged the branch. If the branch has changed on GitHub since this checkout last fetched or pushed it, fetch and review it first.",
+        description: "Push a local branch to GitHub. `workspace` is the absolute path of the checkout that has the branch; commit first. Only branches starting with the repo's branch prefix (see `github_repos`). A rewritten history needs force=true and only works for branches first pushed through this tool, and only while they still continue what was pushed through it: not after someone else re-created or rewrote the branch, or continued it after its commits went into another branch. If the branch has changed on GitHub since this checkout last fetched or pushed it, fetch and review it first.",
         args: &[
             ("workspace", Str, true),
             ("branch", Str, true),
@@ -255,6 +255,7 @@ pub fn check_args(tool: &str, args: &Args, entry: &RepoEntry) -> Result<()> {
     }
     if tool == "github_pr_comment" {
         pulls::place(args)?;
+        pulls::marked(args)?;
     }
     if tool == "github_pr_list" {
         pulls::list_state(args)?;

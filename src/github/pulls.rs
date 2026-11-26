@@ -77,17 +77,24 @@ pub fn place(args: &Args) -> Result<Place<'_>> {
 /// First line of every comment, because GitHub shows the human as its author.
 pub const AGENT_MARK: &str = "[Written by an agent]";
 
-fn marked(body: &str) -> String {
-    match body.trim_start().starts_with(AGENT_MARK) {
-        true => body.to_string(),
-        false => format!("{AGENT_MARK}\n\n{body}"),
+/// The text of a comment as it is posted.
+pub fn marked(args: &Args) -> Result<String> {
+    let body = str_arg(args, "body").unwrap_or_default();
+    let written = body.trim_start().strip_prefix(AGENT_MARK);
+    // GitHub refuses an empty comment; with the mark in front it would not see one.
+    if written.unwrap_or(body).trim().is_empty() {
+        return refuse("the comment has no text");
     }
+    Ok(match written {
+        Some(_) => body.to_string(),
+        None => format!("{AGENT_MARK}\n\n{body}"),
+    })
 }
 
 pub fn comment(api: &Api, args: &Args) -> Result<String> {
     let place = place(args)?;
+    let body = marked(args)?;
     let (number, pr) = load_own(api, args)?;
-    let body = marked(str_arg(args, "body").unwrap_or_default());
     let reply = match place {
         Place::Conversation => {
             api.send("POST", &format!("/issues/{number}/comments"), &json!({"body": body}))?

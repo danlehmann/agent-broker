@@ -381,7 +381,7 @@ impl Db {
             .query_row(
                 "SELECT id, claimed_name FROM link_codes
                  WHERE user_id = ?1 AND claimed_uid = ?2 AND NOT confirmed AND expires > ?3
-                 ORDER BY id LIMIT 1",
+                 ORDER BY id DESC LIMIT 1",
                 params![user_id, uid, now()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -516,6 +516,20 @@ mod tests {
         let again = db.confirm_link(user, 1001).unwrap_err();
         assert_eq!(again.public(), "this unix account is already linked");
         assert!(db.caller(1001, Some("agent")).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_newest_claim_of_a_uid_is_the_one_confirmed() {
+        // The uid went from a deleted account to a new one while the first code was valid.
+        let (_dir, db) = db();
+        let user = db.add_user("alice", false).unwrap();
+        for name in ["old", "new"] {
+            let code = db.new_link_code(user).unwrap();
+            db.claim_link_code(&code, 1001, name).unwrap();
+        }
+        db.confirm_link(user, 1001).unwrap();
+        assert!(db.caller(1001, Some("new")).unwrap().is_some());
+        assert_eq!(db.caller(1001, Some("old")).unwrap(), None);
     }
 
     #[test]

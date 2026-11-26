@@ -129,6 +129,11 @@ fn pull_requests() {
         w.err("github_pr_update", json!({"number": 1, "state": "merged"})).contains("'open' or 'closed'")
     );
     assert!(w.err("github_pr_comment", json!({"number": -1, "body": "x"})).contains("positive"));
+    // With the broker's mark in front, GitHub would no longer refuse an empty comment.
+    for body in ["", " \n", "[Written by an agent]", "[Written by an agent]\n\n "] {
+        let text = w.err("github_pr_comment", json!({"number": 1, "body": body}));
+        assert_eq!(text, "the comment has no text");
+    }
     let inline = |extra: Value| {
         let mut args = json!({"number": 1, "body": "x"});
         args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());

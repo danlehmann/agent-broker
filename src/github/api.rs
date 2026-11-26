@@ -114,12 +114,17 @@ impl Api<'_> {
             let after = (MAX_ITEMS + 1).to_string();
             let mut query = query.to_vec();
             query.extend([("per_page", "1"), ("page", &*after)]);
-            let mut reply = self.get(path, &query)?;
-            let next = match key {
-                Some(key) => reply[key].take(),
-                None => reply,
-            };
-            next.as_array().is_some_and(|list| !list.is_empty())
+            match self.get(path, &query) {
+                Ok(mut reply) => {
+                    let next = match key {
+                        Some(key) => reply[key].take(),
+                        None => reply,
+                    };
+                    next.as_array().is_some_and(|list| !list.is_empty())
+                }
+                // What was read is still worth having; say that there may be more.
+                Err(_) => true,
+            }
         };
         Ok(Paged { items, cut })
     }

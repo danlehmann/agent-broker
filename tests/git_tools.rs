@@ -88,55 +88,49 @@ fn force_is_lost_when_someone_else_makes_the_branch_anew() {
     git(&dir, &["commit", "-q", "--amend", "-m", "on top, reworded"]);
     assert!(!w.push(&dir, true).1);
 
-    // Merged, deleted, then created again from main with new work.
-    let w = World::new();
-    let dir = w.clone("work");
-    w.commit(&dir, "one");
-    assert!(!w.push(&dir, false).1);
-    let human = human_clone(&w, "human", "daniel/x");
-    git(&human, &["push", "-q", "origin", "daniel/x:main", ":daniel/x"]);
-    let theirs = w.commit(&human, "new work after the merge");
-    git(&human, &["push", "-q", "origin", "daniel/x"]);
-    let (text, is_error) = force_after_fetch(&w, &dir);
-    assert!(is_error && text.contains(refused), "{text}");
-    assert_eq!(w.hub_ref("o/a", "daniel/x"), Some(theirs));
+    // Merged, deleted, then created again from where it was merged to, with new work. That
+    // may be any branch, and the default branch may have another name by now.
+    for (merged_into, renamed_to) in [("main", None), ("release", None), ("main", Some("trunk"))] {
+        let w = World::new();
+        let dir = w.clone("work");
+        w.commit(&dir, "one");
+        assert!(!w.push(&dir, false).1);
+        let human = human_clone(&w, "human", "daniel/x");
+        let merge = format!("daniel/x:refs/heads/{merged_into}");
+        git(&human, &["push", "-q", "origin", &merge, ":daniel/x"]);
+        if let Some(name) = renamed_to {
+            git(&w.hub("o/a"), &["branch", "-m", merged_into, name]);
+        }
+        let theirs = w.commit(&human, "new work after the merge");
+        git(&human, &["push", "-q", "origin", "daniel/x"]);
+        let (text, is_error) = force_after_fetch(&w, &dir);
+        let gone_into = format!("had gone into {}, so it may be", renamed_to.unwrap_or(merged_into));
+        assert!(is_error && text.contains(&gone_into), "{text}");
+        assert_eq!(w.hub_ref("o/a", "daniel/x"), Some(theirs));
+    }
 }
 
 #[test]
-fn force_needs_what_it_checks_to_be_known() {
-    // Others added commits, and the default branch cannot be fetched: whether the branch was
-    // merged and made anew is unknown, so the answer is no. The mirror still has an old main.
+fn force_needs_a_record_of_the_last_push() {
     let w = World::new();
     let dir = w.clone("work");
     w.commit(&dir, "one");
     assert!(!w.push(&dir, false).1);
-    let human = human_clone(&w, "human", "daniel/x");
-    // The default branch is renamed on GitHub, after the agent's work went into it.
-    git(&human, &["push", "-q", "origin", "daniel/x:main"]);
-    git(&w.hub("o/a"), &["branch", "-m", "main", "trunk"]);
-    let theirs = w.commit(&human, "more");
-    git(&human, &["push", "-q", "origin", "daniel/x"]);
-    w.ok("github_fetch", json!({"workspace": dir, "branch": "daniel/x"}));
-    git(&dir, &["commit", "-q", "--amend", "-m", "rewrite"]);
-    let (text, is_error) = w.push(&dir, true);
-    assert!(is_error && text.contains("default branch could not be fetched"), "{text}");
-    assert_eq!(w.hub_ref("o/a", "daniel/x"), Some(theirs.clone()));
-    // Untouched by others, the branch needs no such check.
-    git(&dir, &["reset", "-q", "--hard", "origin/daniel/x"]);
-    w.commit(&dir, "on top");
-    assert!(!w.push(&dir, false).1);
-    git(&dir, &["commit", "-q", "--amend", "-m", "on top, reworded"]);
-    assert!(!w.push(&dir, true).1);
-
     // A branch recorded before the broker kept what it pushed.
     let conn = w.broker.db.conn();
     conn.execute("UPDATE github_created_branches SET tip = NULL", []).unwrap();
     drop(conn);
     let before = w.hub_ref("o/a", "daniel/x");
-    git(&dir, &["commit", "-q", "--amend", "-m", "reworded again"]);
+    git(&dir, &["commit", "-q", "--amend", "-m", "reworded"]);
     let (text, is_error) = w.push(&dir, true);
-    assert!(is_error && text.contains("has no record of what it last pushed"), "{text}");
+    assert!(is_error && text.contains("has no record here of what this tool last pushed"), "{text}");
     assert_eq!(w.hub_ref("o/a", "daniel/x"), before);
+    // As the refusal says: a push on top, and force works again.
+    git(&dir, &["reset", "-q", "--hard", "origin/daniel/x"]);
+    w.commit(&dir, "on top");
+    assert!(!w.push(&dir, false).1);
+    git(&dir, &["commit", "-q", "--amend", "-m", "on top, reworded"]);
+    assert!(!w.push(&dir, true).1);
 }
 
 #[test]

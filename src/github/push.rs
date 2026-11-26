@@ -17,8 +17,6 @@ pub struct PendingPush {
     old: Option<String>,
     tip: String,
     expected: Option<String>,
-    /// The default branch's commit on GitHub, if it could be fetched in the first step.
-    default: Option<String>,
     /// Commits the bundle may build on.
     pub basis: Vec<String>,
     pub need_bundle: bool,
@@ -44,41 +42,46 @@ fn commit_arg(local: &Map<String, Value>, name: &str) -> Result<Option<String>> 
     }
 }
 
+/// Where all branches of the repo are fetched to when a forced push has to look at them.
+const OTHERS: &str = "refs/others/";
+
 /// Whether the branch now at `old` is still the one the broker last pushed `last` to. The
 /// name alone does not say so: the branch may have been deleted and created again.
 ///
 /// Returns why not, if not. Whatever cannot be established counts as not.
-fn still_own(
-    mirror: &Mirror,
-    default: Option<&str>,
-    last: Option<&str>,
-    old: &str,
-) -> Result<Option<&'static str>> {
+fn still_own(mirror: &Mirror, branch: &str, last: Option<&str>, old: &str) -> Result<Option<String>> {
+    let advice = "Its history cannot be rewritten. Fetch it and add your commits on top (after that, force works again), or ask the human";
     let Some(last) = last else {
-        return Ok(Some(
-            "this tool has no record of what it last pushed there, so its history cannot be rewritten. Fetch it and add your commits on top (after that, force works again), or ask the human",
-        ));
+        return Ok(Some(format!("has no record here of what this tool last pushed to it. {advice}")));
     };
     if last == old {
         return Ok(None);
     }
-    let other = "no longer continues what this tool pushed there: it was re-created, rewritten or merged by someone else, so its history cannot be rewritten. Fetch it and add your commits on top, or ask the human";
     // Others may add commits on top; the caller must have seen them, which is checked later.
     if !mirror.is_ancestor(last, old)? {
-        return Ok(Some(other));
+        return Ok(Some(format!(
+            "no longer continues what this tool pushed there: someone else re-created or rewrote it. {advice}"
+        )));
     }
-    // What the broker pushed was merged, so a branch that goes on from there is new work.
-    // A failing git command reads as "not an ancestor", so make sure the commit is there.
-    let default = match default {
-        Some(default) => mirror.resolve(default)?,
-        None => None,
+    // If what the broker pushed went into another branch, this one may be new work under an
+    // old name: merged, deleted and created again from where it was merged to. Only branches
+    // as they are on GitHub right now can tell, whichever branch it was merged into.
+    let spec = format!("+refs/heads/*:{OTHERS}*");
+    let fetch = ["fetch", "--prune", "--no-tags", "--quiet", "--no-write-fetch-head", "origin", &spec];
+    let holders = match mirror.git_auth(&fetch)?.ok {
+        true => mirror.git(&["for-each-ref", "--format=%(refname)", "--contains", last, OTHERS])?,
+        false => return Ok(Some(format!("could not be compared with the repo's other branches. {advice}"))),
     };
-    let Some(default) = default else {
-        return Ok(Some(
-            "may have been merged and made anew: that cannot be ruled out, because the repo's default branch could not be fetched. Its history cannot be rewritten now; ask the human to check the default branch of the repo entry",
-        ));
-    };
-    Ok(mirror.is_ancestor(last, &default)?.then_some(other))
+    if !holders.ok {
+        return Ok(Some(format!("could not be compared with the repo's other branches. {advice}")));
+    }
+    let own = format!("{OTHERS}{branch}");
+    Ok(holders.stdout.lines().find(|name| *name != own).map(|name| {
+        format!(
+            "was continued by someone else after what this tool pushed there had gone into {}, so it may be a new branch under an old name. {advice}",
+            name.strip_prefix(OTHERS).unwrap_or(name)
+        )
+    }))
 }
 
 /// The branch's commit on GitHub.
@@ -118,23 +121,18 @@ impl GitHub {
             )?;
             basis.push(old.clone());
         }
-        // A push works without the default branch, only with a larger bundle. A forced one
-        // needs it, and only a ref fetched just now counts: an older one may be stale.
-        let default_ref = fetched_ref(&entry.default_branch);
-        let spec = format!("+refs/heads/{}:{default_ref}", entry.default_branch);
-        let fetch = ["fetch", "--no-tags", "--quiet", "--no-write-fetch-head", "origin", &spec];
-        let default = match mirror.git_auth(&fetch)?.ok {
-            true => mirror.resolve(&default_ref)?,
-            false => None,
-        };
-        if let Some(commit) = &default
-            && !basis.contains(commit)
+        // Only makes the bundle smaller, so a missing default branch is fine.
+        let default = fetched_ref(&entry.default_branch);
+        let spec = format!("+refs/heads/{}:{default}", entry.default_branch);
+        if mirror.git_auth(&["fetch", "--no-tags", "--quiet", "--no-write-fetch-head", "origin", &spec])?.ok
+            && let Some(commit) = mirror.resolve(&default)?
+            && !basis.contains(&commit)
         {
-            basis.push(commit.clone());
+            basis.push(commit);
         }
         let need_bundle = !mirror.is_reachable(&tip)?;
         let force = bool_arg(args, "force");
-        Ok(Begun::Pending(PendingPush { branch, force, old, tip, expected, default, basis, need_bundle }))
+        Ok(Begun::Pending(PendingPush { branch, force, old, tip, expected, basis, need_bundle }))
     }
 
     pub fn push_finish(
@@ -196,8 +194,7 @@ impl GitHub {
                         "{branch} was not first pushed through this tool, so its history cannot be rewritten; ask the human"
                     ));
                 };
-                let (default, last_pushed) = (push.default.as_deref(), last_pushed.as_deref());
-                if let Some(why) = still_own(&mirror, default, last_pushed, old)? {
+                if let Some(why) = still_own(&mirror, branch, last_pushed.as_deref(), old)? {
                     return refuse(format!("{branch} on GitHub ({}) {why}", sha12(old)));
                 }
                 // Guards against accidents only: the caller reports what it last saw.

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs::{DirBuilder, File, Permissions};
-use std::io::{BufReader, Seek, Write};
+use std::io::{BufReader, ErrorKind, Seek, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -179,7 +179,22 @@ fn connection(broker: &Broker, stream: &UnixStream, uid: u32) -> std::io::Result
     stream.set_write_timeout(Some(IDLE))?;
     let mut session = Session { broker, uid, pending: None };
     let mut reader = BufReader::new(stream);
-    while let Some(request) = proto::read_message(&mut reader)? {
+    loop {
+        let request = match proto::read_message(&mut reader) {
+            Ok(Some(request)) => request,
+            Ok(None) => break,
+            Err(e) => {
+                let timed_out = matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut);
+                if timed_out && let Some(pending) = session.pending.take() {
+                    // The caller is still packing. It reads this when it comes back.
+                    let late = "the upload took too long to start; try again";
+                    broker.abandon(uid, &pending, late);
+                    let mut stream = stream;
+                    let _ = proto::write_message(&mut stream, &failure(&Value::Null, late));
+                }
+                return Err(e);
+            }
+        };
         // Also for the bytes of an upload: once it has started, it has to keep coming.
         stream.set_read_timeout(Some(IDLE))?;
         session.request(&mut reader, stream, &request)?;
@@ -229,6 +244,9 @@ impl Session<'_> {
             Some(len) => match self.receive(reader, op, args, len) {
                 Ok(file) => Some(file),
                 Err(e) => {
+                    if let Error::Internal(m) = &e {
+                        log(&format!("{op}: storing the upload: {m}"), None);
+                    }
                     if let Some(pending) = self.pending.take() {
                         self.broker.abandon(self.uid, &pending, e.public());
                     }
