@@ -74,10 +74,20 @@ pub fn place(args: &Args) -> Result<Place<'_>> {
     }
 }
 
+/// First line of every comment, because GitHub shows the human as its author.
+pub const AGENT_MARK: &str = "[Written by an agent]";
+
+fn marked(body: &str) -> String {
+    match body.trim_start().starts_with(AGENT_MARK) {
+        true => body.to_string(),
+        false => format!("{AGENT_MARK}\n\n{body}"),
+    }
+}
+
 pub fn comment(api: &Api, args: &Args) -> Result<String> {
     let place = place(args)?;
     let (number, pr) = load_own(api, args)?;
-    let body = str_arg(args, "body");
+    let body = marked(str_arg(args, "body").unwrap_or_default());
     let reply = match place {
         Place::Conversation => {
             api.send("POST", &format!("/issues/{number}/comments"), &json!({"body": body}))?

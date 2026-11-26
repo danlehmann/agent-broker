@@ -155,6 +155,18 @@ fn pull_requests() {
     assert_eq!(w.ok("github_pr_comment", json!({"number": 1, "body": "hi"})), "commented: http://x/c");
     assert_eq!(w.api.writes(), ["PATCH /repos/o/a/pulls/1", "POST /repos/o/a/issues/1/comments"]);
 
+    {
+        // The mark is added once, also when the agent wrote it already.
+        let seen = w.api.seen.lock().unwrap();
+        let body: Value = serde_json::from_str(&seen.last().unwrap().body).unwrap();
+        assert_eq!(body, json!({"body": "[Written by an agent]\n\nhi"}));
+    }
+    w.ok("github_pr_comment", json!({"number": 1, "body": "[Written by an agent]\n\nhi"}));
+    {
+        let seen = w.api.seen.lock().unwrap();
+        let body: Value = serde_json::from_str(&seen.last().unwrap().body).unwrap();
+        assert_eq!(body, json!({"body": "[Written by an agent]\n\nhi"}));
+    }
     w.api.seen.lock().unwrap().clear();
     w.api.on("POST /repos/o/a/pulls/1/comments/5/replies", json!({"html_url": "http://x/r"}));
     w.api.on("POST /repos/o/a/pulls/1/comments", json!({"html_url": "http://x/l"}));
@@ -172,10 +184,13 @@ fn pull_requests() {
         assert_eq!(
             sent,
             [
-                ("/repos/o/a/pulls/1/comments/5/replies".to_string(), json!({"body": "re"})),
+                (
+                    "/repos/o/a/pulls/1/comments/5/replies".to_string(),
+                    json!({"body": "[Written by an agent]\n\nre"})
+                ),
                 (
                     "/repos/o/a/pulls/1/comments".to_string(),
-                    json!({"body": "new", "commit_id": "abc", "path": "src/f.rs", "line": 3, "side": "RIGHT"})
+                    json!({"body": "[Written by an agent]\n\nnew", "commit_id": "abc", "path": "src/f.rs", "line": 3, "side": "RIGHT"})
                 ),
             ]
         );

@@ -73,7 +73,7 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "github_pr_comment",
-        description: "Comment on a PR from a branch with the repo's branch prefix. By default a conversation comment. With `reply_to` (the id in brackets that github_pr_view shows for a review comment) it answers in that review thread. With `path` and `line` it starts a new inline comment on that line of the PR's current version of the file; the line must be part of the diff. It is posted under the human's name.",
+        description: "Comment on a PR from a branch with the repo's branch prefix. By default a conversation comment. With `reply_to` (the id in brackets that github_pr_view shows for a review comment) it answers in that review thread. With `path` and `line` it starts a new inline comment on that line of the PR's current version of the file; the line must be part of the diff. It is posted under the human's name, so the broker starts it with the line '[Written by an agent]'; do not add a signature of your own.",
         args: &[
             ("number", Integer, true),
             ("body", Str, true),
