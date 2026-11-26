@@ -67,6 +67,12 @@ fn rules_of_the_repo_entry() {
     db.conn().execute("UPDATE linked_accounts SET all_resources = 0", []).unwrap();
     assert!(w.err("github_pr_list", json!({})).contains("no repos are available"));
     assert!(w.err("github_pr_list", json!({"repo": "o/a"})).contains("not available"));
+    // A prefix that covers the default branch does not open it.
+    db.conn().execute("UPDATE linked_accounts SET all_resources = 1", []).unwrap();
+    db.conn().execute("UPDATE resources SET enabled_tools = 'github_pr_create'", []).unwrap();
+    db.conn().execute("UPDATE github_repo_entries SET branch_prefix = 'ma'", []).unwrap();
+    let text = w.err("github_pr_create", json!({"branch": "main", "title": "T"}));
+    assert_eq!(text, "main is the repo's default branch");
     let mut raw = Raw::connect(&w);
     db.conn().execute("UPDATE users SET disabled = 1", []).unwrap();
     assert!(raw.error("tools.list", json!({}), None).contains("not linked"), "takes effect at once");
@@ -218,7 +224,9 @@ fn pull_requests() {
         );
     }
 
-    w.api.on("GET /repos/o/a/pulls", json!([pr(1, "daniel/x", own.clone()), pr(2, "someone/x", own)]));
+    // Not someone else's branch, and not a fork's branch of the same name.
+    let fork = pr(3, "daniel/x", json!({"full_name": "evil/a"}));
+    w.api.on("GET /repos/o/a/pulls", json!([pr(1, "daniel/x", own.clone()), pr(2, "someone/x", own), fork]));
     assert_eq!(w.ok("github_pr_list", json!({})), "#1 [draft] daniel/x: T");
     w.api.on("GET /repos/o/a/pulls", json!([]));
     assert_eq!(w.ok("github_pr_list", json!({"state": "all"})), "no PRs from daniel/* branches");
@@ -247,8 +255,9 @@ fn pull_requests() {
 #[test]
 fn pagination() {
     let w = World::new();
+    let own = json!({"full_name": "o/a"});
     let page = |n: i64, count: i64| -> Value {
-        (0..count).map(|i| pr(n * 1000 + i, "daniel/x", Value::Null)).collect()
+        (0..count).map(|i| pr(n * 1000 + i, "daniel/x", own.clone())).collect()
     };
     let path = |n: i64| format!("GET /repos/o/a/pulls?state=open&per_page=100&page={n}");
     w.api.on(&path(1), page(1, 100));
@@ -262,18 +271,18 @@ fn pagination() {
     w.api.on(after, json!([]));
     assert_eq!(w.ok("github_pr_list", json!({})).lines().count(), 500);
     // Stopping early is said, also when nothing of what was read matched.
-    w.api.on(after, json!([pr(1, "daniel/x", Value::Null)]));
+    w.api.on(after, json!([pr(1, "daniel/x", own.clone())]));
     let text = w.ok("github_pr_list", json!({}));
     assert_eq!(text.lines().count(), 501);
     let note = "(only the 500 newest open PRs of the repo were searched; older ones are missing here)";
     assert_eq!(text.lines().last(), Some(note));
-    let others = |n: i64| -> Value { (0..100).map(|i| pr(n * 1000 + i, "someone/x", Value::Null)).collect() };
+    let others = |n: i64| -> Value { (0..100).map(|i| pr(n * 1000 + i, "someone/x", own.clone())).collect() };
     for n in 1..=5 {
         w.api.on(&path(n), others(n));
     }
     assert_eq!(w.ok("github_pr_list", json!({})), format!("no open PRs from daniel/* branches\n{note}"));
 
-    w.api.on("GET /repos/o/a/pulls/1", pr(1, "daniel/x", Value::Null));
+    w.api.on("GET /repos/o/a/pulls/1", pr(1, "daniel/x", own.clone()));
     w.api.on("GET /repos/o/a/pulls/1/reviews", json!([]));
     w.api.on("GET /repos/o/a/issues/1/comments", json!([]));
     let comment = json!({"id": 5, "user": null, "path": "f", "line": 3, "body": "hm"});
@@ -322,6 +331,21 @@ fn ci() {
 }
 
 #[test]
+fn one_call_makes_a_limited_number_of_requests() {
+    let w = World::new();
+    w.api.on("GET /repos/o/a/commits/abc", json!({"sha": "abc"}));
+    let runs: Vec<Value> = (0..90).map(|id| json!({"id": id, "name": "ci"})).collect();
+    w.api.on("GET /repos/o/a/actions/runs", json!({"workflow_runs": runs}));
+    w.api.on("GET /repos/o/a/actions/runs/0/jobs", json!({"jobs": []}));
+    for id in 1..90 {
+        w.api.on(&format!("GET /repos/o/a/actions/runs/{id}/jobs"), json!({"jobs": []}));
+    }
+    let text = w.err("github_ci_status", json!({"sha": "abc"}));
+    assert!(text.ends_with("needs more than 60 requests to GitHub; ask for something narrower"), "{text}");
+    assert_eq!(w.api.seen.lock().unwrap().len(), 60);
+}
+
+#[test]
 fn logs_follow_a_redirect_without_the_token() {
     let w = World::new();
     let location = format!("Location: {}/blob?sig=1\r\n", w.storage_url);
@@ -364,9 +388,20 @@ fn the_token_stays_in() {
     texts.push(w.err(token, json!({})));
     w.api.raw("POST /repos/o/a/pulls", 422, "", "ECHO");
     texts.push(w.err("github_pr_create", json!({"branch": "daniel/x", "title": token})));
+    // Nor the token of another repo of the same user, which has no shape to go by.
+    let alice = w.broker.db.user_id("alice").unwrap().unwrap();
+    let other = "otherRepoTokenWithoutShape";
+    w.broker.db.add_github_repo(alice, other, "o/c", "daniel/", "main", &["github_pr_create"]).unwrap();
+    w.api.raw("POST /repos/o/a/pulls", 422, "", &format!("said {other}"));
+    let create = |title: &str| json!({"repo": "o/a", "branch": "daniel/x", "title": title});
+    texts.push(w.err("github_pr_create", create("T")));
+    texts.push(w.err("github_pr_create", create(other)));
+    texts.push(w.err(other, json!({})));
     for text in texts {
-        assert!(!text.contains(token), "{text}");
+        assert!(!text.contains(token) && !text.contains(other), "{text}");
     }
+    let audit = serde_json::to_string(&w.broker.db.audit_rows().unwrap()).unwrap();
+    assert!(!audit.contains(other), "{audit}");
     let audit = serde_json::to_string(&w.broker.db.audit_rows().unwrap()).unwrap();
     assert!(!audit.contains(token), "{audit}");
 }

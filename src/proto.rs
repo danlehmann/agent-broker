@@ -53,6 +53,31 @@ pub fn blob_len(message: &Map<String, Value>) -> io::Result<Option<u64>> {
     }
 }
 
+/// Copies exactly `len` bytes, giving up at `deadline`. Timeouts of the socket only limit
+/// each single read or write, so a peer that keeps trickling would never run into them.
+pub fn copy_exact_until(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    len: u64,
+    deadline: std::time::Instant,
+) -> io::Result<()> {
+    let mut buffer = vec![0; 64 * 1024];
+    let mut left = len;
+    while left > 0 {
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "blob took too long"));
+        }
+        let want = buffer.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        let got = reader.read(&mut buffer[..want])?;
+        if got == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "blob cut off"));
+        }
+        writer.write_all(&buffer[..got])?;
+        left -= got as u64;
+    }
+    writer.flush()
+}
+
 /// Copies exactly `len` bytes.
 pub fn copy_exact(reader: &mut impl Read, writer: &mut impl Write, len: u64) -> io::Result<()> {
     let copied = io::copy(&mut reader.take(len), writer)?;

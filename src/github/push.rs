@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 use super::git::{Mirror, TempRef, path_str};
 use super::{GitHub, fetched_ref, is_commit_id, sha12};
 use crate::db::{Db, RepoEntry};
+use crate::dispatch::log;
 use crate::error::{Result, refuse};
 use crate::spec::{Args, bool_arg, str_arg};
 
@@ -217,17 +218,19 @@ impl GitHub {
             None => {
                 let mut text = format!("created {branch} at {}", sha12(&new));
                 if let Err(e) = db.record_branch(entry.resource_id, branch, &new) {
-                    eprintln!("cannot record {branch} as created: {e}");
+                    log(&format!("cannot record {branch} as created: {e}"), Some(&entry.token));
                     text.push_str(" (but force=true will not work for it: recording it failed)");
                 }
                 text
             }
             Some(old) => {
                 // Without this record a later force=true is refused, which is the safe side.
+                let mut text = format!("updated {branch} {} -> {}", sha12(old), sha12(&new));
                 if let Err(e) = db.record_push(entry.resource_id, branch, &new) {
-                    eprintln!("cannot record the push to {branch}: {e}");
+                    log(&format!("cannot record the push to {branch}: {e}"), Some(&entry.token));
+                    text.push_str(" (but force=true will not work for it until its next push: recording this one failed)");
                 }
-                format!("updated {branch} {} -> {}", sha12(old), sha12(&new))
+                text
             }
         };
         Ok(Pushed { text, tip: new, forced })

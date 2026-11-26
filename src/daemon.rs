@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 use std::fs::{DirBuilder, File, Permissions};
-use std::io::{BufReader, ErrorKind, Seek, Write};
+use std::io::{BufReader, ErrorKind, Seek};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
@@ -75,7 +75,14 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 /// connection, not by file permissions.
 fn bind(path: &Path) -> std::io::Result<UnixListener> {
     match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_socket() => std::fs::remove_file(path)?,
+        // Left behind by a daemon that is gone. A live one, perhaps with another data dir,
+        // must not lose its callers to this one.
+        Ok(m) if m.file_type().is_socket() => {
+            if UnixStream::connect(path).is_ok() {
+                return Err(std::io::Error::other("another daemon is listening there"));
+            }
+            std::fs::remove_file(path)?
+        }
         Ok(_) => return Err(std::io::Error::other("exists and is not a socket")),
         Err(_) => {}
     }
@@ -170,6 +177,9 @@ impl Drop for Slot {
     }
 }
 
+/// How long sending or receiving one blob may take in all.
+const BLOB_TIME: Duration = Duration::from_secs(600);
+
 fn failure(id: &Value, message: &str) -> Value {
     json!({"id": id, "ok": false, "error": message})
 }
@@ -198,6 +208,12 @@ fn connection(broker: &Broker, stream: &UnixStream, uid: u32) -> std::io::Result
         // Also for the bytes of an upload: once it has started, it has to keep coming.
         stream.set_read_timeout(Some(IDLE))?;
         session.request(&mut reader, stream, &request)?;
+        // Other requests on the connection do not keep an upload open that is too late.
+        if session.pending.as_ref().is_some_and(Pending::expired)
+            && let Some(pending) = session.pending.take()
+        {
+            broker.abandon(uid, &pending, "the upload took too long to start");
+        }
         stream.set_read_timeout(Some(session.wait()))?;
     }
     Ok(())
@@ -267,7 +283,7 @@ impl Session<'_> {
                 file.rewind()?;
                 let reply = json!({"id": id, "ok": true, "result": value, "blob_len": len});
                 proto::write_message(&mut stream, &reply)?;
-                proto::copy_exact(&mut file, &mut stream, len)
+                proto::copy_exact_until(&mut file, &mut stream, len, Instant::now() + BLOB_TIME)
             }
             Err(e) => {
                 if let Error::Internal(m) = &e {
@@ -297,8 +313,7 @@ impl Session<'_> {
             return refuse("the upload is larger than the broker's limit; ask the human to raise it");
         }
         let mut file = tempfile::NamedTempFile::new_in(self.broker.github.tmp())?;
-        proto::copy_exact(reader, &mut file, len)?;
-        file.flush()?;
+        proto::copy_exact_until(reader, &mut file, len, Instant::now() + BLOB_TIME)?;
         Ok(file)
     }
 
@@ -335,6 +350,19 @@ impl Session<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_socket_is_replaced_only_when_nobody_listens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s");
+        let first = bind(&path).unwrap();
+        assert!(bind(&path).is_err());
+        drop(first);
+        bind(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "").unwrap();
+        assert!(bind(&path).is_err());
+    }
 
     #[test]
     fn directory_checks() {

@@ -132,6 +132,8 @@ pub fn list(api: &Api, args: &Args) -> Result<String> {
     let mut lines: Vec<String> = found
         .items
         .iter()
+        // A fork may have a branch of the same name.
+        .filter(|pr| text(&pr["head"]["repo"]["full_name"]) == api.entry.full_name)
         .filter(|pr| text(&pr["head"]["ref"]).starts_with(prefix.as_str()))
         .map(|pr| {
             let draft = pr["draft"].as_bool() == Some(true);

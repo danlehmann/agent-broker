@@ -246,6 +246,10 @@ pub fn check_args(tool: &str, args: &Args, entry: &RepoEntry) -> Result<()> {
         let Some(value) = str_arg(args, name) else { continue };
         if name == "branch" && writes_branch {
             rules::check_branch(value, &entry.branch_prefix)?;
+            // Whatever the prefix lets through, for example "ma" for "main".
+            if value == entry.default_branch {
+                return refuse(format!("{value} is the repo's default branch"));
+            }
         } else {
             rules::check_plain_ref(value)?;
         }

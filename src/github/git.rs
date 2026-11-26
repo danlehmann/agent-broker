@@ -102,14 +102,16 @@ impl Mirror<'_> {
             .env("PATH", "/usr/bin:/bin")
             .env("LC_ALL", "C")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ALLOW_PROTOCOL", "file:https")
             .env("GIT_CEILING_DIRECTORIES", &self.gh.mirrors);
         if auth {
             // Through the environment, because arguments are visible to every account.
             let value = format!("Authorization: Basic {}", basic_auth(&self.entry.token));
+            // Only for the host the mirrors come from.
             cmd.env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+                .env("GIT_CONFIG_KEY_0", format!("http.{}.extraheader", self.gh.endpoints.git))
                 .env("GIT_CONFIG_VALUE_0", value);
         }
         cmd.arg("-C").arg(&self.path).args(["-c", "fetch.fsckObjects=true"]).args(args);

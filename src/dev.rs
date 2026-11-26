@@ -49,6 +49,11 @@ fn seed(
             let home = platform::own_home().ok_or("no home directory")?;
             let github = GitHub::new(Endpoints::github(), data, home);
             let (full_name, default_branch) = github.look_up_repo(repo, token)?;
+            if default_branch.starts_with(prefix) {
+                return Err(
+                    format!("the prefix {prefix} would cover the default branch {default_branch}").into()
+                );
+            }
             let tools: Vec<&str> = TOOLS.iter().map(|t| t.name).collect();
             db.add_github_repo(user, token, &full_name, prefix, &default_branch, &tools)?;
             println!("added {full_name} (default branch {default_branch})");

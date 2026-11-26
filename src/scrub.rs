@@ -25,6 +25,11 @@ pub fn scrub(text: &str, token: Option<&str>) -> String {
     TOKEN_FORMATS.replace_all(&out, "***").into_owned()
 }
 
+/// [`scrub`] for each of several tokens.
+pub fn scrub_all<'a>(text: &str, tokens: impl IntoIterator<Item = &'a str>) -> String {
+    tokens.into_iter().fold(scrub(text, None), |text, token| scrub(&text, Some(token)))
+}
+
 /// Of a longer text, how much of the start is kept. The rest of the room goes to the end.
 const KEPT_START_CHARS: usize = 20_000;
 

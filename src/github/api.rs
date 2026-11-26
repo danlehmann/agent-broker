@@ -1,5 +1,6 @@
 //! GitHub's REST API.
 
+use std::cell::Cell;
 use std::io::Read;
 use std::time::Duration;
 
@@ -34,11 +35,17 @@ pub fn agent(endpoints: &Endpoints) -> ureq::Agent {
 pub struct Api<'a> {
     gh: &'a GitHub,
     pub entry: &'a RepoEntry,
+    /// Requests made so far for this tool call.
+    requests: Cell<u32>,
 }
+
+/// How many requests one tool call may make. A list of lists can otherwise grow into
+/// thousands of them.
+const MAX_REQUESTS: u32 = 60;
 
 impl GitHub {
     pub(super) fn api<'a>(&'a self, entry: &'a RepoEntry) -> Api<'a> {
-        Api { gh: self, entry }
+        Api { gh: self, entry, requests: Cell::new(0) }
     }
 }
 
@@ -165,6 +172,12 @@ impl Api<'_> {
         }
         let mut redirects = 0;
         loop {
+            self.requests.set(self.requests.get() + 1);
+            if self.requests.get() > MAX_REQUESTS {
+                return fail(format!(
+                    "this call needs more than {MAX_REQUESTS} requests to GitHub; ask for something narrower"
+                ));
+            }
             let with_token = origin(&url) == origin(&self.gh.endpoints.api);
             let mut response = match self.once(method, &url, body, with_token) {
                 Ok(r) => r,

@@ -11,7 +11,7 @@ use crate::db::{AuditEntry, Caller, Db, RepoEntry, random_base32};
 use crate::error::{Error, Result, refuse};
 use crate::github::{self, Begun, GitHub, Output, PendingPush};
 use crate::platform::Identity;
-use crate::scrub::{head, scrub, truncate_output};
+use crate::scrub::{head, scrub, scrub_all, truncate_output};
 use crate::spec::{self, Args, Flow, Tool, str_arg};
 
 const UNLINKED: &str =
@@ -64,6 +64,12 @@ struct Authorized {
 impl Authorized {
     fn token(&self) -> Option<&str> {
         self.entry.as_ref().map(|e| e.token.as_str())
+    }
+
+    /// Every token the caller's calls can involve, not only the one of this call: output of
+    /// one repo may quote what the caller read from another.
+    fn tokens(&self) -> impl Iterator<Item = &str> + Clone {
+        self.repos.iter().map(|r| r.token.as_str())
     }
 
     fn entry(&self) -> Result<&RepoEntry> {
@@ -167,7 +173,7 @@ impl Broker {
                     resource: auth.entry.as_ref().map(|e| e.full_name.as_str()),
                     tool: Some(auth.tool.name),
                     ok: None,
-                    detail: &audit_args(args, auth.token()),
+                    detail: &audit_args(args, auth.tokens()),
                 })?;
                 Ok(auth)
             }
@@ -184,15 +190,17 @@ impl Broker {
 
     /// A refusal may quote the caller's input, which may contain a token it got elsewhere.
     fn scrub_refusal(&self, uid: u32, e: Error) -> Error {
-        let Error::Refused(mut text) = e else { return e };
+        let Error::Refused(text) = e else { return e };
+        Error::Refused(truncate_output(&self.scrub_for(uid, &text)))
+    }
+
+    /// Scrubs with every token the caller's repos have.
+    fn scrub_for(&self, uid: u32, text: &str) -> String {
         let repos = match self.caller(uid) {
             Ok(Some(caller)) => self.db.repos(&caller).unwrap_or_default(),
             _ => vec![],
         };
-        for repo in &repos {
-            text = scrub(&text, Some(&repo.token));
-        }
-        Error::Refused(truncate_output(&scrub(&text, None)))
+        scrub_all(text, repos.iter().map(|r| r.token.as_str()))
     }
 
     fn audit_refusal(&self, uid: u32, call_id: &str, tool: &str, e: &Error) {
@@ -205,7 +213,7 @@ impl Broker {
             call_id: Some(call_id),
             uid: Some(uid),
             username: username.as_deref(),
-            tool: Some(&head(&scrub(tool, None), 100)),
+            tool: Some(&head(&self.scrub_for(uid, tool), 100)),
             ok: Some(false),
             detail: &head(&scrub(e.public(), None), 300),
             ..Default::default()
@@ -241,7 +249,7 @@ impl Broker {
         result: Result<Output>,
         note: &str,
     ) -> Result<Output> {
-        let clean = |s: &str| truncate_output(&scrub(s, auth.token()));
+        let clean = |s: &str| truncate_output(&scrub_all(s, auth.tokens()));
         match result {
             Ok(mut out) => {
                 out.text = clean(&out.text);
@@ -441,12 +449,12 @@ fn call_parts(request: &Args) -> Result<(&str, &Args, &Args)> {
 }
 
 /// Arguments for the audit log: scrubbed, each string cut to 200 characters.
-fn audit_args(args: &Args, token: Option<&str>) -> String {
+fn audit_args<'a>(args: &Args, tokens: impl Iterator<Item = &'a str> + Clone) -> String {
     let cut: Args = args
         .iter()
         .map(|(k, v)| {
             let v = match v {
-                Value::String(s) => Value::String(head(&scrub(s, token), 200)),
+                Value::String(s) => Value::String(head(&scrub_all(s, tokens.clone()), 200)),
                 other => other.clone(),
             };
             (k.clone(), v)
@@ -462,7 +470,7 @@ mod tests {
     #[test]
     fn audit_arguments_are_scrubbed_before_cutting() {
         let args = json!({"body": format!("{}secret-token", "x".repeat(195)), "n": 1});
-        let out = audit_args(args.as_object().unwrap(), Some("secret-token"));
+        let out = audit_args(args.as_object().unwrap(), ["other", "secret-token"].into_iter());
         assert!(!out.contains("secr"));
         assert!(out.contains("\"n\":1"));
     }

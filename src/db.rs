@@ -1,7 +1,7 @@
 //! The daemon's database.
 
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs::{OpenOptions, Permissions};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -159,6 +159,16 @@ impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         // Create it ourselves so that it is never readable by others, whatever the umask.
         OpenOptions::new().create(true).append(true).mode(0o600).open(path)?;
+        // The mode above only counts for a new file. SQLite gives its side files the mode
+        // of the database, so this goes first.
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            match std::fs::set_permissions(&name, Permissions::from_mode(0o600)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -574,12 +584,21 @@ mod tests {
 
     #[test]
     fn file_is_private() {
-        use std::os::unix::fs::PermissionsExt;
         let (d, db) = db();
         db.add_user("x", false).unwrap();
-        for f in std::fs::read_dir(d.path()).unwrap() {
-            let mode = f.unwrap().metadata().unwrap().permissions().mode();
-            assert_eq!(mode & 0o077, 0);
-        }
+        let private = || {
+            for f in std::fs::read_dir(d.path()).unwrap() {
+                let mode = f.unwrap().metadata().unwrap().permissions().mode();
+                assert_eq!(mode & 0o077, 0);
+            }
+        };
+        private();
+        // A file that was opened up is closed again.
+        drop(db);
+        let path = d.path().join("db");
+        std::fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+        let db = Db::open(&path).unwrap();
+        db.add_user("y", false).unwrap();
+        private();
     }
 }

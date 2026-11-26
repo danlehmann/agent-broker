@@ -111,6 +111,21 @@ fn force_is_lost_when_someone_else_makes_the_branch_anew() {
 }
 
 #[test]
+fn a_merged_branch_that_nobody_touched_is_still_the_agents() {
+    // Nothing of anyone else is on the branch, and what was merged stays merged.
+    let w = World::new();
+    let dir = w.clone("work");
+    let one = w.commit(&dir, "one");
+    assert!(!w.push(&dir, false).1);
+    let human = human_clone(&w, "human", "daniel/x");
+    git(&human, &["push", "-q", "origin", "daniel/x:main"]);
+    git(&dir, &["commit", "-q", "--amend", "-m", "reworded"]);
+    let (text, is_error) = w.push(&dir, true);
+    assert!(!is_error, "{text}");
+    assert_eq!(w.hub_ref("o/a", "main"), Some(one));
+}
+
+#[test]
 fn force_needs_a_record_of_the_last_push() {
     let w = World::new();
     let dir = w.clone("work");
