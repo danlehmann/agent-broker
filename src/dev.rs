@@ -26,6 +26,7 @@ fn seed(
     let name = flags.need("user")?;
     if what == "add-user" {
         db.add_user(name, true)?;
+        println!("added user {name}");
         return Ok(());
     }
     let user = db.user_id(name)?.ok_or("no such user")?;
@@ -48,8 +49,10 @@ fn seed(
         }
         "link-code" => println!("{}", db.new_link_code(user)?),
         "confirm" => {
-            let uid = platform::uid_of_account(flags.need("account")?).ok_or("no such account")?;
+            let account = flags.need("account")?;
+            let uid = platform::uid_of_account(account).ok_or("no such account")?;
             db.confirm_link(user, uid)?;
+            println!("linked {account} (uid {uid}) to {name}");
         }
         _ => return Err("dev: add-user, add-repo, link-code or confirm".into()),
     }
