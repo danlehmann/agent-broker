@@ -14,17 +14,19 @@ pub fn create(api: &Api, args: &Args) -> Result<String> {
         true => format!("{}:{branch}", api.entry.owner()),
         false => branch.to_string(),
     };
-    let pr = api.send(
-        "POST",
-        "/pulls",
-        &json!({
-            "title": str_arg(args, "title"),
-            "body": str_arg(args, "body").unwrap_or(""),
-            "head": head,
-            "base": str_arg(args, "base").unwrap_or(api.entry.pr_base()),
-            "draft": true,
-        }),
-    )?;
+    let mut pr = json!({
+        "title": str_arg(args, "title"),
+        "body": str_arg(args, "body").unwrap_or(""),
+        "head": head,
+        "base": str_arg(args, "base").unwrap_or(api.entry.pr_base()),
+        "draft": true,
+    });
+    // GitHub needs the fork's name when both repos have the same owner, where the owner in
+    // `head` does not tell them apart.
+    if api.entry.is_fork() {
+        pr["head_repo"] = json!(api.entry.full_name.rsplit('/').next().unwrap_or_default());
+    }
+    let pr = api.send("POST", "/pulls", &pr)?;
     Ok(format!("opened draft PR #{}: {}", pr["number"], text(&pr["html_url"])))
 }
 
@@ -165,9 +167,19 @@ pub fn view(api: &Api, args: &Args) -> Result<String> {
     let number = match (int_arg(args, "number"), str_arg(args, "branch")) {
         (Some(number), _) => number,
         (None, Some(branch)) => {
-            let head = format!("{}:{branch}", api.entry.owner());
+            // A fork has the branches with the prefix; all others are the other repo's own.
+            let entry = api.entry;
+            let in_fork = entry.is_fork() && branch.starts_with(&entry.branch_prefix);
+            let repo = if in_fork { &entry.full_name } else { entry.pr_repo() };
+            let head = format!("{}:{branch}", repo.split('/').next().unwrap_or_default());
             let found = api.get("/pulls", &[("head", &head), ("state", "all")])?;
-            match found[0]["number"].as_i64() {
+            // The owner alone does not tell a fork from the repo it came from if both have
+            // the same one.
+            let from_there = |pr: &&Value| {
+                text(&pr["head"]["repo"]["full_name"]).eq_ignore_ascii_case(repo) || !entry.is_fork()
+            };
+            match found.as_array().into_iter().flatten().find(from_there).and_then(|pr| pr["number"].as_i64())
+            {
                 Some(number) => number,
                 None => return refuse(format!("no PR for branch {branch}")),
             }

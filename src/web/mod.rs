@@ -525,8 +525,8 @@ impl Web {
                     "Added {}. The token can read it; its default branch is {}.",
                     found.full_name, found.default_branch
                 );
-                if let Some((upstream, _)) = found.parent.as_ref().filter(|_| to_upstream) {
-                    text.push_str(&format!(" Pull requests go to {upstream}."));
+                if let Some(parent) = found.parent.as_ref().filter(|_| to_upstream) {
+                    text.push_str(&format!(" Pull requests go to {}.", parent.full_name));
                 }
                 (text, id)
             }
@@ -596,16 +596,24 @@ impl Web {
             Checked::FirstOn => {
                 ("entry switched on".to_string(), ctx.done("repos", &format!("{read} The entry is now on.")))
             }
-            Checked::NotAFork => (
-                "entry switched off: no longer a fork".to_string(),
-                ctx.back(
-                    "repos",
-                    "err",
-                    &format!(
-                        "GitHub no longer says that {full_name} is a fork, so there is no repo for its pull requests to go to. The entry is switched off; delete it and add the repo again."
+            Checked::NotAFork(other) => {
+                let (detail, what) = match other {
+                    Some(other) => (
+                        format!("entry switched off: GitHub now gives {other} as the repo it was forked from"),
+                        format!(
+                            "GitHub now gives another repo, {other}, as the one {full_name} was forked from. Pull requests are not sent there without your say."
+                        ),
                     ),
-                ),
-            ),
+                    None => (
+                        "entry switched off: no longer a fork".to_string(),
+                        format!(
+                            "GitHub no longer says that {full_name} is a fork, so there is no repo for its pull requests to go to."
+                        ),
+                    ),
+                };
+                let text = format!("{what} The entry is switched off; delete it and add the repo again.");
+                (detail, ctx.back("repos", "err", &text))
+            }
             Checked::Covered(prefix, default_branch) => (
                 format!("entry switched off: prefix {prefix} covers {default_branch}"),
                 ctx.back(

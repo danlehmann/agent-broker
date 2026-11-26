@@ -78,9 +78,15 @@ fn still_own(
     // old name: merged, deleted and created again from where it was merged to. Only branches
     // as they are on GitHub right now can tell, whichever branch it was merged into.
     let mut fetched = true;
-    for (from, to) in [(Some("origin".to_string()), OTHERS), (mirror.upstream(), UPSTREAM)] {
+    // Of the repo a fork came from only the default branch, where its work is merged: that
+    // repo is someone else's and may have any number of branches.
+    let base = entry.upstream_default.as_str();
+    let sources = [
+        (Some("origin".to_string()), format!("+refs/heads/*:{OTHERS}*")),
+        (mirror.upstream(), format!("+refs/heads/{base}:{UPSTREAM}{base}")),
+    ];
+    for (from, spec) in sources {
         let Some(from) = from else { continue };
-        let spec = format!("+refs/heads/*:{to}*");
         let fetch = ["fetch", "--prune", "--no-tags", "--quiet", "--no-write-fetch-head", &from, &spec];
         fetched &= mirror.git_auth(&fetch)?.ok;
     }
@@ -239,7 +245,24 @@ impl GitHub {
         }
         args.extend(["origin".to_string(), target]);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        mirror.git_auth_or("push failed", &args)?;
+        let done = mirror.git_auth(&args)?;
+        if !done.ok {
+            // GitHub wants a special permission for commits that change workflow files. A
+            // branch started from the repo a fork came from can carry such commits of others.
+            let workflows = done.stderr.contains("workflow") && done.stderr.contains("scope");
+            let advice = match (workflows, entry.is_fork()) {
+                (true, true) => format!(
+                    "\nThe branch has changes to workflow files that {} does not have yet. If they are not yours, ask the human to bring the fork's {} up to date with {} on GitHub (\"Sync fork\"), then push again.",
+                    entry.full_name, entry.default_branch, entry.upstream
+                ),
+                (true, false) => {
+                    "\nThe token may not change workflow files; leave them as they are, or ask the human."
+                        .into()
+                }
+                (false, _) => String::new(),
+            };
+            return refuse(format!("push failed:\n{}{advice}", done.stderr));
+        }
 
         // The push happened; nothing below may turn it into a failure.
         let _ = mirror.git(&["update-ref", &fetched_ref(branch), &new]);

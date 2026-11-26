@@ -45,6 +45,14 @@ impl GitHub {
             if current.ok && current.stdout == url {
                 return Ok(mirror);
             }
+            // The repo has a new name since the mirror was made. It is the same entry's
+            // mirror, so it follows.
+            if current.ok
+                && !current.stdout.is_empty()
+                && mirror.git(&["config", "remote.origin.url", &url])?.ok
+            {
+                return Ok(mirror);
+            }
             return Err(Error::Internal(format!("mirror {} is broken", mirror.path.display())));
         }
         std::fs::create_dir_all(&self.mirrors)?;

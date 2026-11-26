@@ -52,7 +52,9 @@ CREATE TABLE github_repo_entries (
     -- for a fork whose pull requests go to the repo it was forked from: that repo and its
     -- default branch; otherwise empty
     upstream TEXT NOT NULL DEFAULT '',
-    upstream_default TEXT NOT NULL DEFAULT ''
+    upstream_default TEXT NOT NULL DEFAULT '',
+    -- GitHub's id of that repo, by which it is known again after a rename; 0 if not known
+    upstream_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE github_created_branches (
     resource_id INTEGER NOT NULL REFERENCES resources ON DELETE CASCADE,
@@ -120,7 +122,7 @@ CREATE TABLE one_time_links (
 );
 ";
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -238,6 +240,11 @@ impl Db {
             tx.execute_batch(
                 "ALTER TABLE github_repo_entries ADD COLUMN upstream TEXT NOT NULL DEFAULT '';
                  ALTER TABLE github_repo_entries ADD COLUMN upstream_default TEXT NOT NULL DEFAULT '';",
+            )?;
+        }
+        if (1..5).contains(&version) {
+            tx.execute_batch(
+                "ALTER TABLE github_repo_entries ADD COLUMN upstream_id INTEGER NOT NULL DEFAULT 0",
             )?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -644,6 +651,7 @@ mod tests {
                 "ALTER TABLE github_created_branches DROP COLUMN tip;
                  ALTER TABLE github_repo_entries DROP COLUMN upstream;
                  ALTER TABLE github_repo_entries DROP COLUMN upstream_default;
+                 ALTER TABLE github_repo_entries DROP COLUMN upstream_id;
                  DROP TABLE sessions; DROP TABLE one_time_links;",
             )
             .unwrap();

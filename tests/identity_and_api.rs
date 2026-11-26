@@ -115,7 +115,8 @@ fn pull_requests_of_a_fork_live_in_the_repo_it_was_forked_from() {
         let body: Value = serde_json::from_str(&seen[0].body).unwrap();
         assert_eq!(
             body,
-            json!({"title": "T", "body": "", "head": "o:daniel/x", "base": "trunk", "draft": true})
+            json!({"title": "T", "body": "", "head": "o:daniel/x", "head_repo": "a", "base": "trunk",
+                   "draft": true})
         );
     }
     // Hers is the PR whose branch is in her fork. Not one from another fork, and not one
@@ -142,6 +143,22 @@ fn pull_requests_of_a_fork_live_in_the_repo_it_was_forked_from() {
     w.api.on("GET /repos/up/a/pulls", json!([from(5, "o/a"), from(9, "evil/a"), from(1, "up/a")]));
     assert_eq!(w.ok("github_pr_list", json!({})), "#1 [draft] daniel/x: T");
 
+    // By branch, a PR is looked for where the branch is: hers in her fork, any other in up/a.
+    let mut theirs = from(1, "up/a");
+    theirs["number"] = json!(2);
+    w.api.on("GET /repos/up/a/pulls/2", theirs.clone());
+    for number in [1, 2] {
+        for list in ["pulls/{}/reviews", "pulls/{}/comments", "issues/{}/comments"] {
+            let list = list.replace("{}", &number.to_string());
+            w.api.on(&format!("GET /repos/up/a/{list}"), json!([]));
+        }
+    }
+    // The owner in the question does not tell the two repos apart if they have the same one.
+    w.api.on("GET /repos/up/a/pulls?head=o%3Adaniel%2Fx&state=all", json!([theirs, from(5, "o/a")]));
+    w.api.on("GET /repos/up/a/pulls?head=up%3Arelease&state=all", json!([from(5, "o/a"), theirs]));
+    assert!(w.ok("github_pr_view", json!({"branch": "daniel/x"})).starts_with("#1 T"));
+    assert!(w.ok("github_pr_view", json!({"branch": "release"})).starts_with("#2 T"));
+
     // CI runs are in up/a too; where her own branch is, her fork says.
     w.api.seen.lock().unwrap().clear();
     w.api.on("GET /repos/o/a/commits/daniel/x", json!({"sha": "abc"}));
@@ -151,6 +168,10 @@ fn pull_requests_of_a_fork_live_in_the_repo_it_was_forked_from() {
     w.api.on("GET /repos/up/a/commits/trunk", json!({"sha": "def"}));
     w.api.on("GET /repos/up/a/commits/def/status", json!({"statuses": []}));
     w.ok("github_ci_status", json!({"branch": "trunk"}));
+    // A commit id is asked about in up/a, whatever it starts with.
+    w.broker.db.conn().execute("UPDATE github_repo_entries SET branch_prefix = 'de'", []).unwrap();
+    w.api.on("GET /repos/up/a/commits/def", json!({"sha": "def"}));
+    w.ok("github_ci_status", json!({"sha": "def"}));
     let asked: Vec<String> =
         w.api.seen.lock().unwrap().iter().map(|r| r.target.split('?').next().unwrap().to_string()).collect();
     assert_eq!(
@@ -160,6 +181,9 @@ fn pull_requests_of_a_fork_live_in_the_repo_it_was_forked_from() {
             "/repos/up/a/actions/runs",
             "/repos/up/a/commits/abc/status",
             "/repos/up/a/commits/trunk",
+            "/repos/up/a/actions/runs",
+            "/repos/up/a/commits/def/status",
+            "/repos/up/a/commits/def",
             "/repos/up/a/actions/runs",
             "/repos/up/a/commits/def/status",
         ]

@@ -15,7 +15,8 @@ pub fn status(api: &Api, args: &Args) -> Result<String> {
         None => match str_arg(args, "branch").or(str_arg(args, "sha")) {
             Some(name) => {
                 // A fork's own branches are in the fork; the runs are where the PRs are.
-                let own = api.entry.is_fork() && name.starts_with(&api.entry.branch_prefix);
+                let own = api.entry.is_fork()
+                    && str_arg(args, "branch").is_some_and(|b| b.starts_with(&api.entry.branch_prefix));
                 let found = match own {
                     true => api.of_pushes().get(&format!("/commits/{name}"), &[])?,
                     false => api.get(&format!("/commits/{name}"), &[])?,

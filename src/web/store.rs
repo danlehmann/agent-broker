@@ -81,8 +81,8 @@ pub enum Checked {
     /// Switched off: this prefix covers that branch, which is a default branch now.
     Covered(String, String),
     /// Switched off: its pull requests are to go to the repo it was forked from, and GitHub
-    /// no longer names one.
-    NotAFork,
+    /// no longer names that one. It names none, or this other one.
+    NotAFork(Option<String>),
 }
 
 /// What the form for a new repo entry said.
@@ -364,8 +364,8 @@ impl Db {
         if let Some(found) = found {
             check_prefix_spares(prefix, &found.default_branch)?;
         }
-        if let Some((_, default_branch)) = parent {
-            check_prefix_spares(prefix, default_branch)?;
+        if let Some(parent) = parent {
+            check_prefix_spares(prefix, &parent.default_branch)?;
         }
         let id = Self::insert_github_repo(
             &tx,
@@ -376,10 +376,11 @@ impl Db {
             found.map_or("", |f| &f.default_branch),
             tools,
         )?;
-        if let Some((upstream, default_branch)) = parent {
+        if let Some(parent) = parent {
             tx.execute(
-                "UPDATE github_repo_entries SET upstream = ?2, upstream_default = ?3 WHERE resource_id = ?1",
-                params![id, upstream, default_branch],
+                "UPDATE github_repo_entries SET upstream = ?2, upstream_default = ?3, upstream_id = ?4
+                 WHERE resource_id = ?1",
+                params![id, parent.full_name, parent.default_branch, parent.id],
             )?;
         }
         match found {
@@ -407,22 +408,28 @@ impl Db {
     ) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let defaults: Option<(String, String)> = tx
+        let stored: Option<(String, String, String)> = tx
             .query_row(
-                "SELECT g.default_branch, g.upstream_default
+                "SELECT g.default_branch, g.upstream, g.upstream_default
                  FROM github_repo_entries g JOIN resources r ON r.id = g.resource_id
                  WHERE r.user_id = ?1 AND r.id = ?2",
                 params![user_id, id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let Some((default_branch, upstream_default)) = defaults else {
+        let Some((default_branch, upstream, upstream_default)) = stored else {
             return refuse("no such repo entry");
         };
         check_prefix_spares(prefix, &default_branch)?;
         check_prefix_spares(prefix, &upstream_default)?;
         if enabled && default_branch.is_empty() {
             return refuse("This entry stays off until \"Check the token\" succeeds.");
+        }
+        // A fork whose other repo a check could not confirm has no default branch stored for it.
+        if enabled && !upstream.is_empty() && upstream_default.is_empty() {
+            return refuse(
+                "This entry stays off: GitHub no longer names the repo it was forked from as it did. Delete the entry and add the repo again.",
+            );
         }
         tx.execute(
             "UPDATE resources SET enabled_tools = ?3, enabled = ?4 WHERE user_id = ?1 AND id = ?2",
@@ -487,21 +494,32 @@ impl Db {
                 "GitHub calls this repo {full_name} now, and there is another entry for that. Delete one of the two."
             ));
         }
-        let (prefix, was_default, enabled, upstream): (String, String, bool, String) = tx.query_row(
-            "SELECT g.branch_prefix, g.default_branch, r.enabled, g.upstream
-             FROM github_repo_entries g JOIN resources r ON r.id = g.resource_id WHERE r.id = ?1",
+        let (prefix, was_default, enabled, upstream, upstream_id): (String, String, bool, String, i64) = tx
+            .query_row(
+            "SELECT g.branch_prefix, g.default_branch, r.enabled, g.upstream, g.upstream_id
+                 FROM github_repo_entries g JOIN resources r ON r.id = g.resource_id WHERE r.id = ?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )?;
-        // Only an entry that was added as a fork has its pull requests go elsewhere.
-        let parent = found.parent.as_ref().filter(|_| !upstream.is_empty());
-        if let Some((upstream, upstream_default)) = parent {
-            tx.execute(
-                "UPDATE github_repo_entries SET upstream = ?2, upstream_default = ?3 WHERE resource_id = ?1",
-                params![id, upstream, upstream_default],
-            )?;
-        }
-        let covered = [Some(default_branch), parent.map(|(_, branch)| branch.as_str())]
+        // Only an entry that was added as a fork has its pull requests go elsewhere, and only
+        // to the repo it was added with. That one may have a new name; another repo that
+        // GitHub now gives as the origin is not it.
+        let is_fork = !upstream.is_empty();
+        let parent =
+            found.parent.as_ref().filter(|parent| is_fork && (upstream_id == 0 || upstream_id == parent.id));
+        match parent {
+            Some(parent) => tx.execute(
+                "UPDATE github_repo_entries SET upstream = ?2, upstream_default = ?3, upstream_id = ?4
+                 WHERE resource_id = ?1",
+                params![id, parent.full_name, parent.default_branch, parent.id],
+            )?,
+            // Without a default branch stored for the other repo the entry cannot be switched on.
+            None => tx.execute(
+                "UPDATE github_repo_entries SET upstream_default = '' WHERE resource_id = ?1",
+                [id],
+            )?,
+        };
+        let covered = [Some(default_branch), parent.map(|parent| parent.default_branch.as_str())]
             .into_iter()
             .flatten()
             .find(|branch| check_prefix_spares(&prefix, branch).is_err());
@@ -509,8 +527,8 @@ impl Db {
             "UPDATE github_repo_entries SET full_name = ?2, default_branch = ?3 WHERE resource_id = ?1",
             params![id, full_name, default_branch],
         )?;
-        let (checked, on) = if !upstream.is_empty() && parent.is_none() {
-            (Checked::NotAFork, false)
+        let (checked, on) = if is_fork && parent.is_none() {
+            (Checked::NotAFork(found.parent.as_ref().map(|parent| parent.full_name.clone())), false)
         } else if let Some(branch) = covered {
             (Checked::Covered(prefix, branch.to_string()), false)
         } else if was_default.is_empty() {

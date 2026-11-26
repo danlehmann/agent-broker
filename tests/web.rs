@@ -538,8 +538,10 @@ fn a_fork_sends_its_pull_requests_to_the_repo_it_was_forked_from() {
             .contains("is not known. Nothing was stored.")
     );
     let fork = |parent: serde_json::Value| json!({"full_name": "alice/proofs", "default_branch": "main", "fork": true, "parent": parent});
-    s.w.api
-        .on("GET /repos/alice/proofs", fork(json!({"full_name": "goat/proofs", "default_branch": "trunk"})));
+    s.w.api.on(
+        "GET /repos/alice/proofs",
+        fork(json!({"id": 40, "full_name": "goat/proofs", "default_branch": "trunk"})),
+    );
     // The prefix must spare the default branch of both.
     assert!(
         s.done(&alice, "repos/add", &form("alice/proofs", "tr"))
@@ -563,22 +565,46 @@ fn a_fork_sends_its_pull_requests_to_the_repo_it_was_forked_from() {
     // A check follows the other repo's rename and its default branch.
     s.w.api.on(
         "GET /repos/alice/proofs",
-        fork(json!({"full_name": "goat/theorems", "default_branch": "al/next"})),
+        fork(json!({"id": 40, "full_name": "goat/theorems", "default_branch": "al/next"})),
     );
     let page = s.done(&alice, &format!("repos/{id}/check"), &[]);
     assert!(page.contains("would cover the default branch al/next. The entry is switched off"), "{page}");
     assert!(page.contains("<code>goat/theorems</code>"));
     // A name that could not go into a URL is not taken from GitHub's answer either.
-    s.w.api.on("GET /repos/alice/proofs", fork(json!({"full_name": "goat/../x", "default_branch": "trunk"})));
+    s.w.api.on(
+        "GET /repos/alice/proofs",
+        fork(json!({"id": 40, "full_name": "goat/../x", "default_branch": "trunk"})),
+    );
     let page = s.done(&alice, &format!("repos/{id}/check"), &[]);
     assert!(page.contains("no longer says that alice/proofs is a fork"), "{page}");
     assert!(!s.w.ok("github_repos", json!({})).contains("alice/proofs"));
+    // Switched off like that, it cannot be switched on by hand: not until a check finds the
+    // same repo again.
+    let on = [("prefix", "al/"), ("enabled", "1")];
+    assert!(s.done(&alice, &format!("repos/{id}/edit"), &on).contains("This entry stays off"));
+    s.w.api.on(
+        "GET /repos/alice/proofs",
+        fork(json!({"id": 40, "full_name": "goat/theorems", "default_branch": "trunk"})),
+    );
+    s.done(&alice, &format!("repos/{id}/check"), &[]);
+    assert!(s.done(&alice, &format!("repos/{id}/edit"), &on).contains("Saved the rules"));
+    assert!(s.w.ok("github_repos", json!({})).contains("pull requests go to goat/theorems"));
+    // Another repo that GitHub gives as the origin later is not the one this was added with.
+    s.w.api.on(
+        "GET /repos/alice/proofs",
+        fork(json!({"id": 41, "full_name": "stranger/proofs", "default_branch": "trunk"})),
+    );
+    let page = s.done(&alice, &format!("repos/{id}/check"), &[]);
+    assert!(page.contains("GitHub now gives another repo, stranger/proofs"), "{page}");
+    assert!(page.contains("<code>goat/theorems</code>"), "{page}");
+    assert!(!s.w.ok("github_repos", json!({})).contains("proofs"));
+    assert!(s.done(&alice, &format!("repos/{id}/edit"), &on).contains("This entry stays off"));
     // An entry that was not added as a fork stays what it is, whatever GitHub says later.
     let own = s.repo_id("alice", "o/a");
     s.w.api.on(
         "GET /repos/o/a",
         json!({"full_name": "o/a", "default_branch": "main", "fork": true,
-        "parent": {"full_name": "goat/a", "default_branch": "main"}}),
+        "parent": {"id": 50, "full_name": "goat/a", "default_branch": "main"}}),
     );
     s.done(&alice, &format!("repos/{own}/check"), &[]);
     let listed = s.w.ok("github_repos", json!({}));

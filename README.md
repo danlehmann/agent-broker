@@ -42,6 +42,10 @@ your fork, under the branch prefix, and open and follow draft pull requests in t
 `github_fetch` gets every branch without the prefix from the other repo, so agents start from
 its current state and not from your fork's copy of it.
 
+Keep the fork's default branch up to date with the other repo ("Sync fork" on GitHub). GitHub
+refuses a push that brings workflow files the fork does not have yet, unless the token has
+the `workflow` scope, and a branch started from the other repo's newer state can do that.
+
 A fine-grained token cannot open pull requests in a repo that is not yours. This needs a
 classic token with the `public_repo` scope. That token could write to all your public repos;
 the broker holds it to the one fork and its prefix.

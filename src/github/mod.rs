@@ -231,7 +231,10 @@ impl GitHub {
         let Some((full_name, default_branch)) = named(&repo) else {
             return refuse("GitHub's answer did not name the repo and its default branch");
         };
-        let parent = if repo["fork"] == true { named(&repo["parent"]) } else { None };
+        let parent = (repo["fork"] == true).then(|| &repo["parent"]).and_then(|parent| {
+            let (full_name, default_branch) = named(parent)?;
+            Some(Parent { id: parent["id"].as_i64().filter(|id| *id > 0)?, full_name, default_branch })
+        });
         Ok(Found { full_name, default_branch, parent })
     }
 }
@@ -241,8 +244,15 @@ pub struct Found {
     /// The canonical name, which may differ from the one asked for in case or after a rename.
     pub full_name: String,
     pub default_branch: String,
-    /// For a fork: the repo it was forked from, and that one's default branch.
-    pub parent: Option<(String, String)>,
+    /// For a fork: the repo it was forked from.
+    pub parent: Option<Parent>,
+}
+
+pub struct Parent {
+    /// GitHub's number for the repo, which stays when the repo is renamed.
+    pub id: i64,
+    pub full_name: String,
+    pub default_branch: String,
 }
 
 /// Text of the `github_repos` tool.

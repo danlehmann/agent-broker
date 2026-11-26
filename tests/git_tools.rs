@@ -130,6 +130,21 @@ fn a_fork_takes_pushes_and_the_repo_it_came_from_gives_the_rest() {
     assert_eq!(w.hub_ref("o/a", "daniel/x"), Some(theirs));
 }
 
+#[test]
+fn a_renamed_repo_keeps_its_mirror() {
+    let w = World::new();
+    let dir = w.clone("work");
+    w.commit(&dir, "one");
+    assert!(!w.push(&dir, false).1);
+    // Renamed on GitHub, and a token check stored the new name.
+    std::fs::rename(w.hub("o/a"), w.hub("o/renamed")).unwrap();
+    w.broker.db.conn().execute("UPDATE github_repo_entries SET full_name = 'o/renamed'", []).unwrap();
+    let two = w.commit(&dir, "two");
+    let (text, is_error) = w.push(&dir, false);
+    assert!(!is_error, "{text}");
+    assert_eq!(w.hub_ref("o/renamed", "daniel/x"), Some(two));
+}
+
 /// A human's clone of the hub, on `branch`.
 fn human_clone(w: &World, name: &str, branch: &str) -> std::path::PathBuf {
     let human = w.dir.path().join(name);
