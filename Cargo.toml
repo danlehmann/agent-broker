@@ -1,0 +1,23 @@
+[package]
+name = "agent-broker"
+version = "0.1.0"
+license = "MIT"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23.1"
+getrandom = "0.4.3"
+nix = { version = "0.32.0", features = ["user", "socket", "fs", "signal", "process", "resource"] }
+regex = "1.13.2"
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+serde_json = "1.0.154"
+sha2 = "0.11.2"
+tempfile = "3.27.0"
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
+
+[features]
+# Seeds the database from the command line until the web UI exists.
+dev-seed = []
+
+[lints.clippy]
+unwrap_used = "deny"

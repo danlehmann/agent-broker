@@ -1,0 +1,148 @@
+//! Pull request tools.
+
+use serde_json::{Map, Value, json};
+
+use super::api::{Api, text};
+use super::rules::check_own_pr;
+use crate::error::{Result, refuse};
+use crate::spec::{Args, int_arg, str_arg};
+
+pub fn create(api: &Api, args: &Args) -> Result<String> {
+    let pr = api.send(
+        "POST",
+        "/pulls",
+        &json!({
+            "title": str_arg(args, "title"),
+            "body": str_arg(args, "body").unwrap_or(""),
+            "head": str_arg(args, "branch"),
+            "base": str_arg(args, "base").unwrap_or(&api.entry.default_branch),
+            "draft": true,
+        }),
+    )?;
+    Ok(format!("opened draft PR #{}: {}", pr["number"], text(&pr["html_url"])))
+}
+
+fn load_own(api: &Api, args: &Args) -> Result<i64> {
+    let number = int_arg(args, "number").unwrap_or(0);
+    let pr = api.get(&format!("/pulls/{number}"), &[])?;
+    check_own_pr(&pr, number, api.entry)?;
+    Ok(number)
+}
+
+/// The fields `github_pr_update` is asked to change.
+pub fn changes(args: &Args) -> Result<Map<String, Value>> {
+    if let Some(state) = str_arg(args, "state")
+        && !matches!(state, "open" | "closed")
+    {
+        return refuse("state must be 'open' or 'closed'");
+    }
+    let change: Map<String, Value> = ["title", "body", "state"]
+        .iter()
+        .filter_map(|n| Some((n.to_string(), args.get(*n)?.clone())))
+        .collect();
+    if change.is_empty() {
+        return refuse("nothing to change");
+    }
+    Ok(change)
+}
+
+pub fn update(api: &Api, args: &Args) -> Result<String> {
+    let change = changes(args)?;
+    let number = load_own(api, args)?;
+    let names: Vec<&str> =
+        ["title", "body", "state"].into_iter().filter(|n| change.contains_key(*n)).collect();
+    let names = names.join(", ");
+    api.send("PATCH", &format!("/pulls/{number}"), &Value::Object(change))?;
+    Ok(format!("updated PR #{number} ({names})"))
+}
+
+pub fn comment(api: &Api, args: &Args) -> Result<String> {
+    let number = load_own(api, args)?;
+    let body = json!({"body": str_arg(args, "body")});
+    let reply = api.send("POST", &format!("/issues/{number}/comments"), &body)?;
+    Ok(format!("commented: {}", text(&reply["html_url"])))
+}
+
+pub fn list_state(args: &Args) -> Result<&str> {
+    match str_arg(args, "state").unwrap_or("open") {
+        s @ ("open" | "closed" | "all") => Ok(s),
+        _ => refuse("state must be 'open', 'closed' or 'all'"),
+    }
+}
+
+pub fn list(api: &Api, args: &Args) -> Result<String> {
+    let state = list_state(args)?;
+    let prefix = &api.entry.branch_prefix;
+    let lines: Vec<String> = api
+        .paged("/pulls", &[("state", state)], None)?
+        .iter()
+        .filter(|pr| text(&pr["head"]["ref"]).starts_with(prefix.as_str()))
+        .map(|pr| {
+            let draft = pr["draft"].as_bool() == Some(true);
+            let shown = if draft { "draft" } else { text(&pr["state"]) };
+            format!("#{} [{shown}] {}: {}", pr["number"], text(&pr["head"]["ref"]), text(&pr["title"]))
+        })
+        .collect();
+    if lines.is_empty() {
+        return Ok(format!("no {state} PRs from {prefix}* branches"));
+    }
+    Ok(lines.join("\n"))
+}
+
+pub fn view(api: &Api, args: &Args) -> Result<String> {
+    let number = match (int_arg(args, "number"), str_arg(args, "branch")) {
+        (Some(number), _) => number,
+        (None, Some(branch)) => {
+            let head = format!("{}:{branch}", api.entry.owner());
+            let found = api.get("/pulls", &[("head", &head), ("state", "all")])?;
+            match found[0]["number"].as_i64() {
+                Some(number) => number,
+                None => return refuse(format!("no PR for branch {branch}")),
+            }
+        }
+        (None, None) => return refuse("give number or branch"),
+    };
+    let pr = api.get(&format!("/pulls/{number}"), &[])?;
+    let flag = |name: &str, shown: &'static str| if pr[name] == true { shown } else { "" };
+    let mut out = format!(
+        "#{number} {}\nstate: {}{}{}, mergeable: {}\nhead: {} @ {}, base: {}\nurl: {}\n\n{}",
+        text(&pr["title"]),
+        text(&pr["state"]),
+        flag("draft", " (draft)"),
+        flag("merged", " (merged)"),
+        text(&pr["mergeable_state"]),
+        text(&pr["head"]["ref"]),
+        text(&pr["head"]["sha"]),
+        text(&pr["base"]["ref"]),
+        text(&pr["html_url"]),
+        Some(text(&pr["body"])).filter(|b| !b.is_empty()).unwrap_or("(no description)"),
+    );
+    let mut section = |heading: &str, path: String, item: &dyn Fn(&Value) -> String| -> Result<()> {
+        let items = api.paged(&path, &[], None)?;
+        if !items.is_empty() {
+            let lines: Vec<String> = items.iter().map(item).collect();
+            out.push_str(&format!("\n\n## {heading}\n{}", lines.join("\n")));
+        }
+        Ok(())
+    };
+    section("Reviews", format!("/pulls/{number}/reviews"), &|r| {
+        format!("- {}: {} {}", text(&r["user"]["login"]), text(&r["state"]), text(&r["body"]))
+            .trim_end()
+            .to_string()
+    })?;
+    section("Review comments", format!("/pulls/{number}/comments"), &|c| {
+        let line = if c["line"].is_null() { &c["original_line"] } else { &c["line"] };
+        let line = line.as_i64().map_or("?".to_string(), |l| l.to_string());
+        format!(
+            "- [{}] {} on {}:{line}:\n{}",
+            c["id"],
+            text(&c["user"]["login"]),
+            text(&c["path"]),
+            text(&c["body"])
+        )
+    })?;
+    section("Comments", format!("/issues/{number}/comments"), &|c| {
+        format!("- {}:\n{}", text(&c["user"]["login"]), text(&c["body"]))
+    })?;
+    Ok(out)
+}
