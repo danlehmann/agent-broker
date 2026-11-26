@@ -167,6 +167,13 @@ impl GitHub {
         }
     }
 
+    /// Removes what is kept for a repo entry that is gone.
+    pub fn forget(&self, resource_id: i64) {
+        let lock = self.lock(resource_id);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = std::fs::remove_dir_all(self.mirrors.join(format!("{resource_id}.git")));
+    }
+
     pub fn tmp(&self) -> &std::path::Path {
         &self.tmp
     }

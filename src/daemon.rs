@@ -17,6 +17,7 @@ use crate::error::{Error, Result, refuse};
 use crate::github::{Endpoints, GitHub};
 use crate::platform::{self, Kernel};
 use crate::proto;
+use crate::web::{self, Web, auth::Cost};
 
 const IDLE: Duration = Duration::from_secs(120);
 const MAX_CONNECTIONS: usize = 256;
@@ -106,6 +107,12 @@ pub fn run(options: &Options) -> Fatal {
     let db = Db::open(&options.data_dir.join("broker.db")).map_err(|e| e.to_string())?;
     let github = GitHub::new(Endpoints::github(), &options.data_dir, home);
     let broker = Arc::new(Broker::new(db, github, Box::new(Kernel), platform::own_uid()));
+
+    let admin = options.run_dir.join("admin.sock");
+    let listener = bind(&admin).map_err(|e| format!("{}: {e}", admin.display()))?;
+    let web = Arc::new(Web::new(broker.clone(), Cost::default()));
+    std::thread::spawn(move || web::serve(web, listener));
+    log(&format!("web UI on {}", admin.display()), None);
 
     let socket = options.run_dir.join("agent.sock");
     let listener = bind(&socket).map_err(|e| format!("{}: {e}", socket.display()))?;

@@ -11,25 +11,24 @@ pull requests: write; actions: read) and four accounts, named here by role:
 ## Set up
 
 ```sh
-cargo build --release --features dev-seed
+cargo build --release
 sudo install -m 755 target/release/agent-broker /usr/local/bin/
 sudo useradd --system --create-home --shell /usr/sbin/nologin BROKER
 sudo chmod 700 ~BROKER
 sudo install -d -o BROKER -m 755 /run/agent-broker
 
 b() { sudo -u BROKER -H agent-broker "$@"; }
-b dev add-user --user YOU
-b dev add-repo --user YOU --repo OWNER/NAME --prefix YOU/          # paste the token
 b daemon                                                           # leave running
+b init                                                             # in another terminal
 ```
 
-Link an agent account (A); leave the other one (B) unlinked:
+`init` asks for the name of the first admin (`YOU`) and prints a one-time link and the line
+that forwards the web interface. Open the link, set a password and log in. Then, in the
+browser:
 
-```sh
-b dev link-code --user YOU
-sudo -u A -H agent-broker link                                     # type the code
-b dev confirm --user YOU --account A
-```
+- **Repos:** add `OWNER/NAME` with the token and the branch prefix `YOU/`.
+- **Linked accounts:** get a link code, run `sudo -u A -H agent-broker link`, type the code,
+  and confirm on the page. Leave `B` unlinked.
 
 ## Check
 
@@ -45,6 +44,12 @@ b dev confirm --user YOU --account A
       shows no token.
 - [ ] `sudo grep -c github_pat ~BROKER/data/broker.db-wal ~BROKER/data/broker.db`
       finds the token only as stored credential: none in the `audit` table.
+- [ ] `/run/agent-broker/admin.sock`, opened without the forward's port and name (for
+      example `curl --unix-socket ... http://other.example/`), is refused; a second browser
+      profile that has the link of a logged-in page but no cookie gets the login page.
+- [ ] No page shows a token, and `sudo grep -c` for the session cookie's value in
+      `~BROKER/data/broker.db*` finds nothing.
+- [ ] `b reset-login YOU` prints a link that sets a new password and ends the old sessions.
 - [ ] Starting the daemon with sudo as root, with a data dir of mode 755, or twice is refused.
 - [ ] Deleting and recreating A under the same uid but another name makes it unlinked.
 
