@@ -22,11 +22,12 @@ pub fn create(api: &Api, args: &Args) -> Result<String> {
     Ok(format!("opened draft PR #{}: {}", pr["number"], text(&pr["html_url"])))
 }
 
-fn load_own(api: &Api, args: &Args) -> Result<i64> {
+/// Loads the PR and checks that it comes from one of the caller's branches.
+fn load_own(api: &Api, args: &Args) -> Result<(i64, Value)> {
     let number = int_arg(args, "number").unwrap_or(0);
     let pr = api.get(&format!("/pulls/{number}"), &[])?;
     check_own_pr(&pr, number, api.entry)?;
-    Ok(number)
+    Ok((number, pr))
 }
 
 /// The fields `github_pr_update` is asked to change.
@@ -48,7 +49,7 @@ pub fn changes(args: &Args) -> Result<Map<String, Value>> {
 
 pub fn update(api: &Api, args: &Args) -> Result<String> {
     let change = changes(args)?;
-    let number = load_own(api, args)?;
+    let (number, _) = load_own(api, args)?;
     let names: Vec<&str> =
         ["title", "body", "state"].into_iter().filter(|n| change.contains_key(*n)).collect();
     let names = names.join(", ");
@@ -56,10 +57,42 @@ pub fn update(api: &Api, args: &Args) -> Result<String> {
     Ok(format!("updated PR #{number} ({names})"))
 }
 
+/// Where `github_pr_comment` puts the comment.
+pub enum Place<'a> {
+    Conversation,
+    Reply(i64),
+    Line(&'a str, i64),
+}
+
+pub fn place(args: &Args) -> Result<Place<'_>> {
+    match (int_arg(args, "reply_to"), str_arg(args, "path"), int_arg(args, "line")) {
+        (None, None, None) => Ok(Place::Conversation),
+        (Some(id), None, None) => Ok(Place::Reply(id)),
+        (None, Some(path), Some(line)) if !path.is_empty() => Ok(Place::Line(path, line)),
+        (None, _, _) => refuse("an inline comment needs both path and line"),
+        (Some(_), _, _) => refuse("give either reply_to or path and line, not both"),
+    }
+}
+
 pub fn comment(api: &Api, args: &Args) -> Result<String> {
-    let number = load_own(api, args)?;
-    let body = json!({"body": str_arg(args, "body")});
-    let reply = api.send("POST", &format!("/issues/{number}/comments"), &body)?;
+    let place = place(args)?;
+    let (number, pr) = load_own(api, args)?;
+    let body = str_arg(args, "body");
+    let reply = match place {
+        Place::Conversation => {
+            api.send("POST", &format!("/issues/{number}/comments"), &json!({"body": body}))?
+        }
+        // GitHub only accepts the id of a review comment on this same PR.
+        Place::Reply(id) => {
+            api.send("POST", &format!("/pulls/{number}/comments/{id}/replies"), &json!({"body": body}))?
+        }
+        Place::Line(path, line) => api.send(
+            "POST",
+            &format!("/pulls/{number}/comments"),
+            &json!({"body": body, "commit_id": text(&pr["head"]["sha"]), "path": path,
+                    "line": line, "side": "RIGHT"}),
+        )?,
+    };
     Ok(format!("commented: {}", text(&reply["html_url"])))
 }
 
@@ -133,8 +166,9 @@ pub fn view(api: &Api, args: &Args) -> Result<String> {
     section("Review comments", format!("/pulls/{number}/comments"), &|c| {
         let line = if c["line"].is_null() { &c["original_line"] } else { &c["line"] };
         let line = line.as_i64().map_or("?".to_string(), |l| l.to_string());
+        let reply = c["in_reply_to_id"].as_i64().map_or(String::new(), |id| format!(" (reply to {id})"));
         format!(
-            "- [{}] {} on {}:{line}:\n{}",
+            "- [{}]{reply} {} on {}:{line}:\n{}",
             c["id"],
             text(&c["user"]["login"]),
             text(&c["path"]),

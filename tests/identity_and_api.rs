@@ -129,6 +129,23 @@ fn pull_requests() {
         w.err("github_pr_update", json!({"number": 1, "state": "merged"})).contains("'open' or 'closed'")
     );
     assert!(w.err("github_pr_comment", json!({"number": -1, "body": "x"})).contains("positive"));
+    let inline = |extra: Value| {
+        let mut args = json!({"number": 1, "body": "x"});
+        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        w.err("github_pr_comment", args)
+    };
+    assert!(inline(json!({"reply_to": 0})).contains("'reply_to' must be positive"));
+    assert!(inline(json!({"path": "f", "line": 0})).contains("'line' must be positive"));
+    assert!(inline(json!({"path": "f"})).contains("both path and line"));
+    assert!(inline(json!({"line": 3})).contains("both path and line"));
+    assert!(inline(json!({"path": "", "line": 3})).contains("both path and line"));
+    assert!(inline(json!({"reply_to": 5, "path": "f", "line": 3})).contains("not both"));
+    assert!(inline(json!({"reply_to": 5, "line": 3})).contains("not both"));
+    // Inline comments are held to the same rule as conversation comments.
+    let refusal = "PR #2 is not from a daniel/* branch of o/a";
+    assert_eq!(w.err("github_pr_comment", json!({"number": 2, "body": "x", "reply_to": 5})), refusal);
+    let on_line = json!({"number": 2, "body": "x", "path": "f", "line": 3});
+    assert_eq!(w.err("github_pr_comment", on_line), refusal);
     assert!(w.api.writes().is_empty());
 
     w.api.on("PATCH /repos/o/a/pulls/1", json!({}));
@@ -137,6 +154,32 @@ fn pull_requests() {
     assert_eq!(text, "updated PR #1 (title, state)");
     assert_eq!(w.ok("github_pr_comment", json!({"number": 1, "body": "hi"})), "commented: http://x/c");
     assert_eq!(w.api.writes(), ["PATCH /repos/o/a/pulls/1", "POST /repos/o/a/issues/1/comments"]);
+
+    w.api.seen.lock().unwrap().clear();
+    w.api.on("POST /repos/o/a/pulls/1/comments/5/replies", json!({"html_url": "http://x/r"}));
+    w.api.on("POST /repos/o/a/pulls/1/comments", json!({"html_url": "http://x/l"}));
+    let text = w.ok("github_pr_comment", json!({"number": 1, "body": "re", "reply_to": 5}));
+    assert_eq!(text, "commented: http://x/r");
+    let text = w.ok("github_pr_comment", json!({"number": 1, "body": "new", "path": "src/f.rs", "line": 3}));
+    assert_eq!(text, "commented: http://x/l");
+    {
+        let seen = w.api.seen.lock().unwrap();
+        let sent: Vec<(String, Value)> = seen
+            .iter()
+            .filter(|r| r.method != "GET")
+            .map(|r| (r.target.clone(), serde_json::from_str(&r.body).unwrap()))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                ("/repos/o/a/pulls/1/comments/5/replies".to_string(), json!({"body": "re"})),
+                (
+                    "/repos/o/a/pulls/1/comments".to_string(),
+                    json!({"body": "new", "commit_id": "abc", "path": "src/f.rs", "line": 3, "side": "RIGHT"})
+                ),
+            ]
+        );
+    }
 
     w.api.on("GET /repos/o/a/pulls", json!([pr(1, "daniel/x", own.clone()), pr(2, "someone/x", own)]));
     assert_eq!(w.ok("github_pr_list", json!({})), "#1 [draft] daniel/x: T");
@@ -152,14 +195,15 @@ fn pull_requests() {
     w.api.on(
         "GET /repos/o/a/pulls/1/comments",
         json!([{"id": 5, "user": null, "path": "f",
-             "line": null, "original_line": 3, "body": "hm"}]),
+             "line": null, "original_line": 3, "body": "hm"},
+            {"id": 6, "user": {"login": "d"}, "path": "f", "line": 3, "in_reply_to_id": 5, "body": "ok"}]),
     );
     w.api.on("GET /repos/o/a/issues/1/comments", json!([]));
     assert_eq!(
         w.ok("github_pr_view", json!({"number": 1})),
         "#1 T\nstate: open (draft), mergeable: clean\nhead: daniel/x @ abc, base: main\n\
          url: http://x/1\n\n(no description)\n\n## Reviews\n- r: APPROVED\n\n\
-         ## Review comments\n- [5]  on f:3:\nhm"
+         ## Review comments\n- [5]  on f:3:\nhm\n- [6] (reply to 5) d on f:3:\nok"
     );
 }
 
