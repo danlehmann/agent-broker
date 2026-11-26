@@ -13,7 +13,15 @@ pub fn status(api: &Api, args: &Args) -> Result<String> {
     let sha = match int_arg(args, "pr") {
         Some(pr) => text(&api.get(&format!("/pulls/{pr}"), &[])?["head"]["sha"]).to_string(),
         None => match str_arg(args, "branch").or(str_arg(args, "sha")) {
-            Some(name) => text(&api.get(&format!("/commits/{name}"), &[])?["sha"]).to_string(),
+            Some(name) => {
+                // A fork's own branches are in the fork; the runs are where the PRs are.
+                let own = api.entry.is_fork() && name.starts_with(&api.entry.branch_prefix);
+                let found = match own {
+                    true => api.of_pushes().get(&format!("/commits/{name}"), &[])?,
+                    false => api.get(&format!("/commits/{name}"), &[])?,
+                };
+                text(&found["sha"]).to_string()
+            }
             None => return refuse("give one of pr, branch, sha"),
         },
     };

@@ -100,6 +100,73 @@ fn pr(number: i64, head: &str, repo: Value) -> Value {
 }
 
 #[test]
+fn pull_requests_of_a_fork_live_in_the_repo_it_was_forked_from() {
+    let w = World::new();
+    // o/a is alice's fork of up/a.
+    w.broker
+        .db
+        .conn()
+        .execute("UPDATE github_repo_entries SET upstream = 'up/a', upstream_default = 'trunk'", [])
+        .unwrap();
+    w.api.on("POST /repos/up/a/pulls", json!({"number": 7, "html_url": "http://x/7"}));
+    w.ok("github_pr_create", json!({"branch": "daniel/x", "title": "T"}));
+    {
+        let seen = w.api.seen.lock().unwrap();
+        let body: Value = serde_json::from_str(&seen[0].body).unwrap();
+        assert_eq!(
+            body,
+            json!({"title": "T", "body": "", "head": "o:daniel/x", "base": "trunk", "draft": true})
+        );
+    }
+    // Hers is the PR whose branch is in her fork. Not one from another fork, and not one
+    // from a branch of that name in up/a itself.
+    let from = |id: i64, name: &str| {
+        let mut pr = pr(1, "daniel/x", json!({"id": id, "full_name": name}));
+        pr["base"]["repo"] = json!({"id": 1, "full_name": "up/a"});
+        pr
+    };
+    w.api.on("PATCH /repos/up/a/pulls/1", json!({}));
+    w.api.on("POST /repos/up/a/issues/1/comments", json!({"html_url": "http://x/c"}));
+    for (id, name) in [(9, "evil/a"), (1, "up/a")] {
+        w.api.on("GET /repos/up/a/pulls/1", from(id, name));
+        let text = w.err("github_pr_update", json!({"number": 1, "title": "N"}));
+        assert_eq!(text, "PR #1 is not from a daniel/* branch of o/a");
+        assert!(w.err("github_pr_comment", json!({"number": 1, "body": "hi"})).contains("is not from"));
+    }
+    w.api.seen.lock().unwrap().clear();
+    w.api.on("GET /repos/up/a/pulls/1", from(5, "o/a"));
+    w.ok("github_pr_update", json!({"number": 1, "title": "N"}));
+    w.ok("github_pr_comment", json!({"number": 1, "body": "hi"}));
+    assert_eq!(w.api.writes(), ["PATCH /repos/up/a/pulls/1", "POST /repos/up/a/issues/1/comments"]);
+    // The list is of up/a's PRs, cut down to hers.
+    w.api.on("GET /repos/up/a/pulls", json!([from(5, "o/a"), from(9, "evil/a"), from(1, "up/a")]));
+    assert_eq!(w.ok("github_pr_list", json!({})), "#1 [draft] daniel/x: T");
+
+    // CI runs are in up/a too; where her own branch is, her fork says.
+    w.api.seen.lock().unwrap().clear();
+    w.api.on("GET /repos/o/a/commits/daniel/x", json!({"sha": "abc"}));
+    w.api.on("GET /repos/up/a/actions/runs", json!({"workflow_runs": []}));
+    w.api.on("GET /repos/up/a/commits/abc/status", json!({"statuses": []}));
+    w.ok("github_ci_status", json!({"branch": "daniel/x"}));
+    w.api.on("GET /repos/up/a/commits/trunk", json!({"sha": "def"}));
+    w.api.on("GET /repos/up/a/commits/def/status", json!({"statuses": []}));
+    w.ok("github_ci_status", json!({"branch": "trunk"}));
+    let asked: Vec<String> =
+        w.api.seen.lock().unwrap().iter().map(|r| r.target.split('?').next().unwrap().to_string()).collect();
+    assert_eq!(
+        asked,
+        [
+            "/repos/o/a/commits/daniel/x",
+            "/repos/up/a/actions/runs",
+            "/repos/up/a/commits/abc/status",
+            "/repos/up/a/commits/trunk",
+            "/repos/up/a/actions/runs",
+            "/repos/up/a/commits/def/status",
+        ]
+    );
+}
+
+#[test]
 fn pull_requests() {
     let w = World::new();
     let own = json!({"id": 1, "full_name": "o/a"});

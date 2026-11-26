@@ -23,8 +23,9 @@ impl GitHub {
         let branch = match branch {
             Some(b) => b.to_string(),
             None => {
-                let out = mirror
-                    .git_auth_or("cannot reach GitHub", &["ls-remote", "--symref", "origin", "HEAD"])?;
+                let from = mirror.upstream().unwrap_or("origin".into());
+                let out =
+                    mirror.git_auth_or("cannot reach GitHub", &["ls-remote", "--symref", &from, "HEAD"])?;
                 let name = out
                     .lines()
                     .filter_map(|l| l.strip_prefix("ref: refs/heads/")?.split_once('\t'))
@@ -40,8 +41,9 @@ impl GitHub {
 
         let name = fetched_ref(&branch);
         let spec = format!("+refs/heads/{branch}:{name}");
+        let from = mirror.source(&branch);
         let done =
-            mirror.git_auth(&["fetch", "--no-tags", "--quiet", "--no-write-fetch-head", "origin", &spec])?;
+            mirror.git_auth(&["fetch", "--no-tags", "--quiet", "--no-write-fetch-head", &from, &spec])?;
         if !done.ok {
             if done.stderr.contains("couldn't find remote ref") {
                 let _ = mirror.git(&["update-ref", "-d", &name]);

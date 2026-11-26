@@ -147,9 +147,17 @@ impl Frame<'_> {
             ));
             let token = "<label>Replace the token</label>\
                  <input type=\"password\" name=\"token\" autocomplete=\"off\" required> <button>Replace</button>";
+            let upstream = match repo.upstream.as_str() {
+                "" => String::new(),
+                upstream => format!(
+                    "<p>A fork: pull requests go to <code>{}</code>, default branch <code>{}</code>.</p>",
+                    esc(upstream),
+                    esc(&repo.upstream_default)
+                ),
+            };
             body.push_str(&format!(
                 "<section><h2>{}</h2><p>{state} &middot; default branch {default} &middot; \
-                 <span class=\"muted\">{verified}</span></p>{}{}<p>{}{}</p></section>",
+                 <span class=\"muted\">{verified}</span></p>{upstream}{}{}<p>{}{}</p></section>",
                 esc(&repo.full_name),
                 self.form(&format!("repos/{}/edit", repo.id), "", &edit),
                 self.form(&format!("repos/{}/token", repo.id), "", token),
@@ -164,6 +172,12 @@ impl Frame<'_> {
              Contents and Pull requests set to read and write, and Actions and Commit statuses \
              set to read-only. Do not give it the Workflows permission. It is stored here and \
              never shown again.</p>\
+             <label class=\"check\"><input type=\"checkbox\" name=\"to_upstream\" value=\"1\"> \
+             This is my fork, and pull requests go to the repo it was forked from</label>\
+             <p class=\"muted\">Agents then push to your fork, and open and follow pull requests in \
+             the other repo, where everyone sees them under your name. That needs a classic \
+             token with the <code>public_repo</code> scope: a fine-grained token cannot open \
+             pull requests in a repo that is not yours.</p>\
              <label>Branch prefix</label><input type=\"text\" name=\"prefix\" placeholder=\"yourname/\" required>\
              <p class=\"muted\">Agents can only push branches whose names start with this.</p>\
              <label>Enabled tools</label>",

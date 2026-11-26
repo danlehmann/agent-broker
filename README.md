@@ -34,6 +34,18 @@ socket), authenticator-app codes for logging in, and a build on macOS.
    account, type the code, and confirm on the page.
 5. Give the agent's harness the MCP server `{"command": "agent-broker", "args": ["mcp"]}`.
 
+### Someone else's repo
+
+To have agents work on a repo you cannot push to, fork it on GitHub and add the fork, ticking
+"This is my fork, and pull requests go to the repo it was forked from". Agents then push to
+your fork, under the branch prefix, and open and follow draft pull requests in the other repo.
+`github_fetch` gets every branch without the prefix from the other repo, so agents start from
+its current state and not from your fork's copy of it.
+
+A fine-grained token cannot open pull requests in a repo that is not yours. This needs a
+classic token with the `public_repo` scope. That token could write to all your public repos;
+the broker holds it to the one fork and its prefix.
+
 If you are locked out, `agent-broker reset-login USERNAME`, run as the daemon's account, prints
 a one-time link to set a new password. Making the link logs that user out everywhere at once.
 

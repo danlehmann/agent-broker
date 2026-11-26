@@ -35,6 +35,8 @@ pub fn agent(endpoints: &Endpoints) -> ureq::Agent {
 pub struct Api<'a> {
     gh: &'a GitHub,
     pub entry: &'a RepoEntry,
+    /// The repo that is asked: the entry's own, or the one it was forked from.
+    repo: &'a str,
     /// Requests made so far for this tool call.
     requests: Cell<u32>,
 }
@@ -44,8 +46,14 @@ pub struct Api<'a> {
 const MAX_REQUESTS: u32 = 60;
 
 impl GitHub {
+    /// For the repo that branches are pushed to.
     pub(super) fn api<'a>(&'a self, entry: &'a RepoEntry) -> Api<'a> {
-        Api { gh: self, entry, requests: Cell::new(0) }
+        Api { gh: self, entry, repo: &entry.full_name, requests: Cell::new(0) }
+    }
+
+    /// For the repo that has the pull requests and their CI runs.
+    pub(super) fn pr_api<'a>(&'a self, entry: &'a RepoEntry) -> Api<'a> {
+        Api { gh: self, entry, repo: entry.pr_repo(), requests: Cell::new(0) }
     }
 }
 
@@ -83,6 +91,11 @@ fn origin(url: &str) -> Option<&str> {
 }
 
 impl Api<'_> {
+    /// The same, for the repo that branches are pushed to.
+    pub fn of_pushes(&self) -> Api<'_> {
+        self.gh.api(self.entry)
+    }
+
     /// How many more requests this call may make.
     pub fn requests_left(&self) -> u32 {
         MAX_REQUESTS.saturating_sub(self.requests.get())
@@ -157,7 +170,7 @@ impl Api<'_> {
     }
 
     fn full_path(&self, path: &str) -> String {
-        format!("/repos/{}{path}", self.entry.full_name)
+        format!("/repos/{}{path}", self.repo)
     }
 
     fn request(

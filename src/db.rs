@@ -48,7 +48,11 @@ CREATE TABLE github_repo_entries (
     resource_id INTEGER PRIMARY KEY REFERENCES resources ON DELETE CASCADE,
     full_name TEXT NOT NULL COLLATE NOCASE,
     branch_prefix TEXT NOT NULL,
-    default_branch TEXT NOT NULL
+    default_branch TEXT NOT NULL,
+    -- for a fork whose pull requests go to the repo it was forked from: that repo and its
+    -- default branch; otherwise empty
+    upstream TEXT NOT NULL DEFAULT '',
+    upstream_default TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE github_created_branches (
     resource_id INTEGER NOT NULL REFERENCES resources ON DELETE CASCADE,
@@ -116,7 +120,7 @@ CREATE TABLE one_time_links (
 );
 ";
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -132,19 +136,38 @@ pub struct Caller {
 }
 
 /// One GitHub repo as configured by one user. Deliberately not `Debug`: it holds the token.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RepoEntry {
     pub resource_id: i64,
+    /// Where branches are pushed.
     pub full_name: String,
     pub branch_prefix: String,
     pub default_branch: String,
     pub enabled_tools: Vec<String>,
     pub token: String,
+    /// For a fork whose pull requests go to the repo it was forked from: that repo and its
+    /// default branch. Otherwise empty.
+    pub upstream: String,
+    pub upstream_default: String,
 }
 
 impl RepoEntry {
     pub fn owner(&self) -> &str {
         self.full_name.split('/').next().unwrap_or("")
+    }
+
+    pub fn is_fork(&self) -> bool {
+        !self.upstream.is_empty()
+    }
+
+    /// The repo whose pull requests and CI runs the tools work with.
+    pub fn pr_repo(&self) -> &str {
+        if self.is_fork() { &self.upstream } else { &self.full_name }
+    }
+
+    /// The branch a pull request goes to unless another is named.
+    pub fn pr_base(&self) -> &str {
+        if self.is_fork() { &self.upstream_default } else { &self.default_branch }
     }
 }
 
@@ -211,6 +234,12 @@ impl Db {
         if version < 3 {
             tx.execute_batch(WEB_TABLES)?;
         }
+        if (1..4).contains(&version) {
+            tx.execute_batch(
+                "ALTER TABLE github_repo_entries ADD COLUMN upstream TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE github_repo_entries ADD COLUMN upstream_default TEXT NOT NULL DEFAULT '';",
+            )?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(Db { conn: Mutex::new(conn) })
@@ -256,7 +285,8 @@ impl Db {
     pub fn repos(&self, caller: &Caller) -> Result<Vec<RepoEntry>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT r.id, g.full_name, g.branch_prefix, g.default_branch, r.enabled_tools, c.token
+            "SELECT r.id, g.full_name, g.branch_prefix, g.default_branch, r.enabled_tools, c.token,
+                    g.upstream, g.upstream_default
              FROM resources r
              JOIN github_repo_entries g ON g.resource_id = r.id
              JOIN credentials c ON c.id = r.credential_id AND c.user_id = r.user_id
@@ -274,6 +304,8 @@ impl Db {
                 default_branch: r.get(3)?,
                 enabled_tools: tools.split(' ').filter(|t| !t.is_empty()).map(Into::into).collect(),
                 token: r.get(5)?,
+                upstream: r.get(6)?,
+                upstream_default: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -381,7 +413,8 @@ impl Db {
         )?;
         let resource = tx.last_insert_rowid();
         tx.execute(
-            "INSERT INTO github_repo_entries VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO github_repo_entries (resource_id, full_name, branch_prefix, default_branch)
+             VALUES (?1, ?2, ?3, ?4)",
             params![resource, full_name, branch_prefix, default_branch],
         )?;
         Ok(resource)
@@ -609,6 +642,8 @@ mod tests {
             let conn = db.conn();
             conn.execute_batch(
                 "ALTER TABLE github_created_branches DROP COLUMN tip;
+                 ALTER TABLE github_repo_entries DROP COLUMN upstream;
+                 ALTER TABLE github_repo_entries DROP COLUMN upstream_default;
                  DROP TABLE sessions; DROP TABLE one_time_links;",
             )
             .unwrap();
@@ -625,6 +660,9 @@ mod tests {
         let (id, secret) = db.create_session(user).unwrap();
         assert!(db.session(&id, &secret).unwrap().is_some());
         db.new_one_time_link(user, "setup").unwrap();
+        // Its repo entries are plain ones, as all were.
+        let rows = db.repo_rows(user).unwrap();
+        assert_eq!((rows.len(), rows[0].upstream.as_str()), (1, ""));
         drop(db);
         Db::open(&path).unwrap();
     }

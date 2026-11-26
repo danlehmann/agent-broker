@@ -45,6 +45,8 @@ fn commit_arg(local: &Map<String, Value>, name: &str) -> Result<Option<String>> 
 
 /// Where all branches of the repo are fetched to when a forced push has to look at them.
 const OTHERS: &str = "refs/others/";
+/// The same for the repo a fork was forked from, where its work is merged.
+const UPSTREAM: &str = "refs/upstream/";
 
 /// Whether the branch now at `old` is still the one the broker last pushed `last` to. The
 /// name alone does not say so: the branch may have been deleted and created again.
@@ -75,21 +77,25 @@ fn still_own(
     // If what the broker pushed went into another branch, this one may be new work under an
     // old name: merged, deleted and created again from where it was merged to. Only branches
     // as they are on GitHub right now can tell, whichever branch it was merged into.
-    let spec = format!("+refs/heads/*:{OTHERS}*");
-    let fetch = ["fetch", "--prune", "--no-tags", "--quiet", "--no-write-fetch-head", "origin", &spec];
-    let holders = match mirror.git_auth(&fetch)?.ok {
-        true => mirror.git(&["for-each-ref", "--format=%(refname)", "--contains", last, OTHERS])?,
+    let mut fetched = true;
+    for (from, to) in [(Some("origin".to_string()), OTHERS), (mirror.upstream(), UPSTREAM)] {
+        let Some(from) = from else { continue };
+        let spec = format!("+refs/heads/*:{to}*");
+        let fetch = ["fetch", "--prune", "--no-tags", "--quiet", "--no-write-fetch-head", &from, &spec];
+        fetched &= mirror.git_auth(&fetch)?.ok;
+    }
+    let holders = match fetched {
+        true => mirror.git(&["for-each-ref", "--format=%(refname)", "--contains", last, OTHERS, UPSTREAM])?,
         false => return Ok(Some(format!("could not be compared with the repo's other branches. {advice}"))),
     };
     if !holders.ok {
         return Ok(Some(format!("could not be compared with the repo's other branches. {advice}")));
     }
     // Not the agents' own branches: one stacked on this one has its commits without any merge.
-    let merged_into = holders
-        .stdout
-        .lines()
-        .filter_map(|name| name.strip_prefix(OTHERS))
-        .find(|name| *name != branch && !name.starts_with(&entry.branch_prefix));
+    let merged_into = holders.stdout.lines().find_map(|name| {
+        let own = |name: &&str| *name != branch && !name.starts_with(&entry.branch_prefix);
+        name.strip_prefix(OTHERS).filter(own).or(name.strip_prefix(UPSTREAM))
+    });
     Ok(merged_into.map(|name| {
         format!(
             "was continued by someone else after what this tool pushed there had gone into {name}, so it may be a new branch under an old name. {advice}"
@@ -143,9 +149,10 @@ impl GitHub {
             basis.push(old.clone());
         }
         // Only makes the bundle smaller, so a missing default branch is fine.
-        let default = fetched_ref(&entry.default_branch);
-        let spec = format!("+refs/heads/{}:{default}", entry.default_branch);
-        if mirror.git_auth(&["fetch", "--no-tags", "--quiet", "--no-write-fetch-head", "origin", &spec])?.ok
+        let base = entry.pr_base();
+        let (default, from) = (fetched_ref(base), mirror.source(base));
+        let spec = format!("+refs/heads/{base}:{default}");
+        if mirror.git_auth(&["fetch", "--no-tags", "--quiet", "--no-write-fetch-head", &from, &spec])?.ok
             && let Some(commit) = mirror.resolve(&default)?
             && !basis.contains(&commit)
         {

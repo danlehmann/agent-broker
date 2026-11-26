@@ -25,7 +25,7 @@ use crate::scrub::{head, scrub};
 use auth::{Cost, Delays, check_new_password, hash_password, verify_password};
 pub use http::{pairs, serve};
 use pages::Frame;
-use store::{Checked, Session, User, UserChange};
+use store::{Checked, NewRepo, Session, User, UserChange};
 
 const COOKIE: &str = "ab_session";
 /// A sensitive change needs the password again after this many seconds.
@@ -515,12 +515,21 @@ impl Web {
         rules::check_repo_name(name)?;
         let (prefix, tools) = Self::rules_from_form(ctx)?;
         let token = Self::token(ctx)?;
+        let to_upstream = field(&ctx.req.form, "to_upstream").is_some();
+        let new = NewRepo { token, typed: name, prefix, tools: &tools, to_upstream };
         let found = self.broker.github.look_up_repo(name, token);
         let (text, id) = match &found {
-            Ok((full_name, default_branch)) => (
-                format!("Added {full_name}. The token can read it; its default branch is {default_branch}."),
-                db.add_repo(user.id, token, full_name, prefix, Some(default_branch), &tools)?,
-            ),
+            Ok(found) => {
+                let id = db.add_repo(user.id, &new, Some(found))?;
+                let mut text = format!(
+                    "Added {}. The token can read it; its default branch is {}.",
+                    found.full_name, found.default_branch
+                );
+                if let Some((upstream, _)) = found.parent.as_ref().filter(|_| to_upstream) {
+                    text.push_str(&format!(" Pull requests go to {upstream}."));
+                }
+                (text, id)
+            }
             // The token may be waiting for an organisation's approval, so keep it.
             Err(e) => {
                 let why = scrub(e.public(), Some(token));
@@ -528,13 +537,17 @@ impl Web {
                     format!(
                         "Saved {name}, but switched off: the token could not read the repo.\n{why}\nUse \"Check the token\" once that is sorted out."
                     ),
-                    db.add_repo(user.id, token, name, prefix, None, &tools)?,
+                    db.add_repo(user.id, &new, None)?,
                 )
             }
         };
         let row = db.repo_row(user.id, id)?;
         let state = if row.enabled { "on" } else { "off: the token could not read the repo" };
-        let detail = format!("entry {id}, prefix {prefix}, {state}");
+        let upstream = match row.upstream.as_str() {
+            "" => String::new(),
+            upstream => format!(", pull requests to {upstream}"),
+        };
+        let detail = format!("entry {id}, prefix {prefix}{upstream}, {state}");
         self.note(ctx, "repo added", true, Some(&row.full_name), &detail);
         Ok(ctx.done("repos", &text))
     }
@@ -554,7 +567,7 @@ impl Web {
             }
         };
         let event = if new_token.is_some() { "token replaced" } else { "token checked" };
-        let (full_name, default_branch) = match self.broker.github.look_up_repo(&row.full_name, token) {
+        let found = match self.broker.github.look_up_repo(&row.full_name, token) {
             Ok(found) => found,
             Err(e) => {
                 let why = scrub(e.public(), Some(token));
@@ -572,8 +585,9 @@ impl Web {
                 return Ok(ctx.back("repos", "err", &text));
             }
         };
+        let full_name = &found.full_name;
         let read = format!("The token can read {full_name}.");
-        let (detail, resp) = match db.set_repo_checked(user.id, id, new_token, &full_name, &default_branch)? {
+        let (detail, resp) = match db.set_repo_checked(user.id, id, new_token, &found)? {
             Checked::On => ("entry on".to_string(), ctx.done("repos", &read)),
             Checked::Off => (
                 "entry off".to_string(),
@@ -582,7 +596,17 @@ impl Web {
             Checked::FirstOn => {
                 ("entry switched on".to_string(), ctx.done("repos", &format!("{read} The entry is now on.")))
             }
-            Checked::Covered(prefix) => (
+            Checked::NotAFork => (
+                "entry switched off: no longer a fork".to_string(),
+                ctx.back(
+                    "repos",
+                    "err",
+                    &format!(
+                        "GitHub no longer says that {full_name} is a fork, so there is no repo for its pull requests to go to. The entry is switched off; delete it and add the repo again."
+                    ),
+                ),
+            ),
+            Checked::Covered(prefix, default_branch) => (
                 format!("entry switched off: prefix {prefix} covers {default_branch}"),
                 ctx.back(
                     "repos",
@@ -593,7 +617,7 @@ impl Web {
                 ),
             ),
         };
-        self.note(ctx, event, true, Some(&full_name), &detail);
+        self.note(ctx, event, true, Some(full_name), &detail);
         Ok(resp)
     }
 

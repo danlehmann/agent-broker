@@ -8,14 +8,20 @@ use crate::error::{Result, refuse};
 use crate::spec::{Args, int_arg, str_arg};
 
 pub fn create(api: &Api, args: &Args) -> Result<String> {
+    let branch = str_arg(args, "branch").unwrap_or_default();
+    // From a fork, the branch is named with the fork's owner.
+    let head = match api.entry.is_fork() {
+        true => format!("{}:{branch}", api.entry.owner()),
+        false => branch.to_string(),
+    };
     let pr = api.send(
         "POST",
         "/pulls",
         &json!({
             "title": str_arg(args, "title"),
             "body": str_arg(args, "body").unwrap_or(""),
-            "head": str_arg(args, "branch"),
-            "base": str_arg(args, "base").unwrap_or(&api.entry.default_branch),
+            "head": head,
+            "base": str_arg(args, "base").unwrap_or(api.entry.pr_base()),
             "draft": true,
         }),
     )?;
@@ -134,9 +140,8 @@ pub fn list(api: &Api, args: &Args) -> Result<String> {
     let mut lines: Vec<String> = found
         .items
         .iter()
-        // A fork may have a branch of the same name.
-        .filter(|pr| super::rules::same_repo(pr))
-        .filter(|pr| text(&pr["head"]["ref"]).starts_with(prefix.as_str()))
+        // Another repo may have a branch of the same name.
+        .filter(|pr| super::rules::own_pr(pr, api.entry))
         .map(|pr| {
             let draft = pr["draft"].as_bool() == Some(true);
             let shown = if draft { "draft" } else { text(&pr["state"]) };

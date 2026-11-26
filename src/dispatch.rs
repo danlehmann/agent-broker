@@ -488,8 +488,7 @@ mod tests {
             full_name: n.into(),
             branch_prefix: "p/".into(),
             default_branch: "main".into(),
-            enabled_tools: vec![],
-            token: String::new(),
+            ..Default::default()
         };
         let two = [entry("o/a"), entry("o/b")];
         assert!(pick_repo(&two[..0], None).is_err());

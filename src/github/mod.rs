@@ -43,13 +43,13 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "github_fetch",
-        description: "Get the current state of a branch (default: the repo's default branch) from GitHub into the checkout at `workspace`, as origin/<branch>; merge or rebase onto that as usual. Any branch can be fetched.",
+        description: "Get the current state of a branch (default: the repo's default branch) from GitHub into the checkout at `workspace`, as origin/<branch>; merge or rebase onto that as usual. Any branch can be fetched. For a fork (see `github_repos`), branches with the branch prefix come from the fork, and all others, the default one included, from the repo it was forked from.",
         args: &[("workspace", Str, true), ("repo", Str, false), ("branch", Str, false)],
         flow: Flow::Download,
     },
     Tool {
         name: "github_pr_create",
-        description: "Open a draft pull request for an already pushed branch. Marking it ready for review and merging are left to the human.",
+        description: "Open a draft pull request for an already pushed branch. Marking it ready for review and merging are left to the human. For a fork (see `github_repos`) it is opened in the repo it was forked from, where other people see it under the human's name.",
         args: &[
             ("branch", Str, true),
             ("title", Str, true),
@@ -204,7 +204,7 @@ impl GitHub {
         entry: &RepoEntry,
         max_blob: u64,
     ) -> Result<Output> {
-        let api = self.api(entry);
+        let api = self.pr_api(entry);
         Ok(match tool {
             "github_fetch" => self.fetch(entry, str_arg(args, "branch"), local, max_blob)?,
             "github_pr_create" => pulls::create(&api, args)?.into(),
@@ -218,24 +218,31 @@ impl GitHub {
         })
     }
 
-    /// Canonical name and default branch, as the token sees them.
-    pub fn look_up_repo(&self, full_name: &str, token: &str) -> Result<(String, String)> {
-        let entry = RepoEntry {
-            resource_id: 0,
-            full_name: full_name.into(),
-            branch_prefix: String::new(),
-            default_branch: String::new(),
-            enabled_tools: vec![],
-            token: token.into(),
-        };
+    /// What GitHub says about a repo, as the token sees it.
+    pub fn look_up_repo(&self, full_name: &str, token: &str) -> Result<Found> {
+        let entry = RepoEntry { full_name: full_name.into(), token: token.into(), ..Default::default() };
         let repo = self.api(&entry).get("", &[])?;
-        let (name, default_branch) = (api::text(&repo["full_name"]), api::text(&repo["default_branch"]));
-        // The rules are checked against both, so an answer without them is no answer.
-        if name.is_empty() || default_branch.is_empty() {
+        let named = |repo: &Value| -> Option<(String, String)> {
+            let (name, default_branch) = (api::text(&repo["full_name"]), api::text(&repo["default_branch"]));
+            // The name goes into URLs, and the rules are checked against both.
+            let usable = rules::check_repo_name(name).is_ok() && !default_branch.is_empty();
+            usable.then(|| (name.to_string(), default_branch.to_string()))
+        };
+        let Some((full_name, default_branch)) = named(&repo) else {
             return refuse("GitHub's answer did not name the repo and its default branch");
-        }
-        Ok((name.into(), default_branch.into()))
+        };
+        let parent = if repo["fork"] == true { named(&repo["parent"]) } else { None };
+        Ok(Found { full_name, default_branch, parent })
     }
+}
+
+/// A repo as GitHub describes it.
+pub struct Found {
+    /// The canonical name, which may differ from the one asked for in case or after a rename.
+    pub full_name: String,
+    pub default_branch: String,
+    /// For a fork: the repo it was forked from, and that one's default branch.
+    pub parent: Option<(String, String)>,
 }
 
 /// Text of the `github_repos` tool.
@@ -246,8 +253,15 @@ pub fn list_repos(repos: &[RepoEntry]) -> String {
     let lines: Vec<String> = repos
         .iter()
         .map(|r| {
+            let upstream = match r.is_fork() {
+                true => format!(
+                    ", a fork: pull requests go to {} (default branch {}), and github_fetch gets every branch without the prefix from there",
+                    r.upstream, r.upstream_default
+                ),
+                false => String::new(),
+            };
             format!(
-                "{}: branch prefix {}, default branch {}, tools: {}",
+                "{}: branch prefix {}, default branch {}{upstream}, tools: {}",
                 r.full_name,
                 r.branch_prefix,
                 r.default_branch,
