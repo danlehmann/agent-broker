@@ -332,6 +332,18 @@ impl Db {
         if changed == 0 {
             return refuse("no such repo entry");
         }
+        // A rename on GitHub can make two entries mean the same repo. One repo, one set of rules.
+        let duplicate: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM github_repo_entries g JOIN resources r ON r.id = g.resource_id
+             WHERE r.user_id = ?1 AND g.full_name = ?2 AND r.id <> ?3)",
+            params![user_id, full_name, id],
+            |r| r.get(0),
+        )?;
+        if duplicate {
+            return refuse(format!(
+                "GitHub calls this repo {full_name} now, and there is another entry for that. Delete one of the two."
+            ));
+        }
         tx.execute(
             "UPDATE github_repo_entries SET full_name = ?2, default_branch = ?3 WHERE resource_id = ?1",
             params![id, full_name, default_branch],
@@ -476,8 +488,18 @@ impl Db {
         Ok(())
     }
 
+    /// Deletes a user. Their audit entries stay, under a name no later user can have: someone
+    /// who is given the same username must not find them in their own log.
     pub fn delete_user(&self, id: i64) -> Result<()> {
-        self.conn().execute("DELETE FROM users WHERE id = ?1", [id])?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE audit SET username = username || ' (deleted)'
+             WHERE username = (SELECT username FROM users WHERE id = ?1)",
+            [id],
+        )?;
+        tx.execute("DELETE FROM users WHERE id = ?1", [id])?;
+        tx.commit()?;
         Ok(())
     }
 

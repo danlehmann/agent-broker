@@ -13,6 +13,8 @@ use serde_json::json;
 
 const HOST: &str = "localhost:8443";
 const PASSWORD: &str = "correct horse battery";
+/// The unix account the person's browser reaches the socket from.
+const HUMAN: u32 = 7000;
 
 struct Site {
     w: World,
@@ -35,8 +37,21 @@ impl Site {
     }
 
     fn request(&self, method: &str, target: &str, cookies: &str, form: &[(&str, &str)]) -> Resp {
+        self.request_as(HUMAN, method, target, cookies, form)
+    }
+
+    /// A request from the given unix account.
+    fn request_as(
+        &self,
+        peer: u32,
+        method: &str,
+        target: &str,
+        cookies: &str,
+        form: &[(&str, &str)],
+    ) -> Resp {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         self.web.handle(&Req {
+            peer,
             method: method.into(),
             path: path.into(),
             query: pairs(query),
@@ -203,7 +218,14 @@ fn login_takes_the_right_password_and_slows_guessing() {
     let resp = attempt("alice", PASSWORD);
     assert!(resp.status == 401 && resp.body.contains("Too many attempts"), "{}", resp.body);
     std::thread::sleep(std::time::Duration::from_millis(1100));
+    // Another unix account, an agent's for one, cannot keep her out by failing for her.
+    let form = [("username", "alice"), ("password", "a wrong guess!")];
+    for _ in 0..8 {
+        assert_eq!(s.request_as(STRANGER, "POST", "/login", "", &form).status, 401);
+    }
     assert_eq!(attempt("alice", PASSWORD).status, 303);
+    // A name too long to be one is turned down without being kept.
+    assert_eq!(attempt(&"x".repeat(70_000), PASSWORD).status, 401);
     // A disabled user cannot log in.
     s.w.broker.db.conn().execute("UPDATE users SET disabled = 1 WHERE username = 'alice'", []).unwrap();
     assert_eq!(attempt("alice", PASSWORD).status, 401);
@@ -371,6 +393,26 @@ fn repos_are_set_up_in_the_browser_and_tokens_never_come_back() {
         assert!(!seen.contains(secret), "{secret}");
     }
 
+    // A check stores what GitHub says now, and that can switch the entry off: here the
+    // default branch moved under the prefix.
+    s.done(&alice, &edit, &[("prefix", "alice/"), ("tool", "github_push"), ("enabled", "1")]);
+    s.w.api.on("GET /repos/O/Renamed", json!({"full_name": "O/Renamed", "default_branch": "alice/main"}));
+    let page = s.done(&alice, &format!("repos/{id}/check"), &[]);
+    assert!(page.contains("would cover the default branch alice/main. The entry is switched off"), "{page}");
+    assert!(page.contains("<code>alice/main</code>"));
+    assert!(!s.w.ok("github_repos", json!({})).contains("O/Renamed"));
+    assert!(s.done(&alice, &edit, &[("prefix", "alice/"), ("enabled", "1")]).contains("would cover"));
+    // A rename on GitHub must not leave two entries for one repo.
+    s.w.api.on("GET /repos/O/Renamed", json!({"full_name": "o/a", "default_branch": "main"}));
+    let page = s.done(&alice, &format!("repos/{id}/check"), &[]);
+    assert!(page.contains("GitHub calls this repo o/a now, and there is another entry for that."), "{page}");
+    assert_eq!(s.repo_id("alice", "O/Renamed"), id);
+    // The entry was filed under the name GitHub gave, not the one typed.
+    let rows = s.w.broker.db.audit_rows().unwrap();
+    let added: Vec<_> =
+        rows.iter().filter(|r| r["event"] == "repo added").map(|r| r["resource"].clone()).collect();
+    assert_eq!(added, [json!("O/New")]);
+
     // Deleting removes the entry, the token and the mirror.
     let mirror = s.w.dir.path().join(format!("data/mirrors/{id}.git"));
     std::fs::create_dir_all(&mirror).unwrap();
@@ -460,7 +502,19 @@ fn the_password_is_changed_with_the_old_one() {
     let change = |old: &str, new: &str, again: &str| {
         s.post(&alice, "account/password", &[("_password", old), ("new", new), ("again", again)])
     };
-    assert!(change("not the password", new, new).body.contains("That was not the password."));
+    // A wrong current password goes back to the form. No page carries the new one.
+    let wrong = change("not the password", new, new);
+    assert_eq!(wrong.status, 303);
+    let page = s.request("GET", &wrong.location.unwrap(), &alice.cookies, &[]).body;
+    assert!(page.contains("That was not the password.") && !page.contains(new));
+    // While she has to wait, the right password is not called wrong, and the wait does not grow.
+    let page = s.done(&alice, "account/password", &[("_password", PASSWORD), ("new", new), ("again", new)]);
+    assert!(page.contains("Too many attempts. Try again in 1 seconds."), "{page}");
+    let id = s.repo_id("alice", "o/a");
+    s.w.broker.db.conn().execute("UPDATE sessions SET last_password = last_password - 301", []).unwrap();
+    let ask = s.post(&alice, &format!("repos/{id}/delete"), &[("_password", PASSWORD)]).body;
+    assert!(ask.contains("Too many attempts") && !ask.contains("That was not the password."));
+    assert_eq!(s.audit().matches("password check").count(), 1);
     std::thread::sleep(std::time::Duration::from_millis(1100));
     let page =
         s.done(&alice, "account/password", &[("_password", PASSWORD), ("new", new), ("again", "other")]);
@@ -620,6 +674,15 @@ fn admins_manage_users_but_one_admin_always_remains() {
         )
         .unwrap();
     assert_eq!(left, 0);
+    // Someone who later gets the same name does not find the old user's entries.
+    assert!(s.audit().contains("\"username\":\"bob (deleted)\""));
+    let page = s.post(&alice, "users/add", &[("username", "bob")]).body;
+    let at = page.find("http://localhost:8443/setup/").unwrap();
+    let link = &page[at + 21..at + 28 + 52];
+    assert_eq!(s.request("POST", link, "", &[("new", PASSWORD), ("again", PASSWORD)]).status, 303);
+    let bob = s.login("bob", PASSWORD);
+    let log = s.get(&bob, "audit").body;
+    assert!(!log.contains("github_repos") && log.contains("login ok"), "{}", text(&log));
     let audit = s.audit();
     for event in ["user created", "user admin", "user disable", "user delete", "reset link made"] {
         assert!(audit.contains(&format!("\"event\":\"{event}\"")), "{event}");
@@ -645,7 +708,8 @@ fn over_the_socket_pages_come_with_strict_headers() {
     let lower = reply.to_lowercase();
     for header in [
         "cache-control: no-store",
-        "referrer-policy: no-referrer",
+        // Not "no-referrer": with that, browsers send forms with the origin "null".
+        "referrer-policy: same-origin",
         "x-content-type-options: nosniff",
         "content-security-policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
         "content-type: text/html; charset=utf-8",
@@ -668,6 +732,17 @@ fn over_the_socket_pages_come_with_strict_headers() {
         exchange("GET / HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n")
             .starts_with("HTTP/1.1 400")
     );
+    // What could be read in two ways is not read at all.
+    for bad in [
+        "GET / HTTP/1.1\r\nHost: localhost\r\nHost: localhost\r\n\r\n",
+        "POST /login HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "POST /login HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nxx",
+        "GET http://localhost/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "GET / HTTP/2\r\nHost: localhost\r\n\r\n",
+        "GET /\r\n\r\n",
+    ] {
+        assert!(exchange(bad).starts_with("HTTP/1.1 400"), "{bad}");
+    }
     let huge = "x".repeat(70_000);
     let reply = exchange(&format!(
         "POST /login HTTP/1.1\r\nHost: localhost:8443\r\nOrigin: http://localhost:8443\r\n\

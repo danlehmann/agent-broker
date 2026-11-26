@@ -42,6 +42,8 @@ pub struct Req {
     pub origin: Option<String>,
     pub cookies: String,
     pub form: Vec<(String, String)>,
+    /// The unix account on the other end of the socket.
+    pub peer: u32,
 }
 
 #[derive(Default)]
@@ -239,7 +241,11 @@ impl Web {
         let password = field(&req.form, "password").unwrap_or_default();
         let fail =
             |text: &str| Ok(Resp { status: 401, body: pages::login(None, Some(text)), ..Default::default() });
-        if let Some(wait) = self.delays.wait(username) {
+        // Too long to be a user's name: not looked up, and not remembered.
+        if username.len() > auth::MAX_USERNAME_BYTES {
+            return fail("Wrong username or password.");
+        }
+        if let Some(wait) = self.delays.wait(req.peer, username) {
             return fail(&format!("Too many attempts. Try again in {} seconds.", wait.as_secs() + 1));
         }
         let found = self.broker.db.login(username)?;
@@ -247,7 +253,7 @@ impl Web {
         let right = verify_password(password, stored, self.cost);
         let user = found.as_ref().map(|(user, _)| user).filter(|user| right && !user.disabled);
         let Some(user) = user else {
-            self.delays.failed(username);
+            self.delays.failed(req.peer, username);
             // Anyone on the machine can try to log in, so these must not fill the log.
             let audited = {
                 let mut window = self.audited_failures.lock().unwrap_or_else(|e| e.into_inner());
@@ -262,7 +268,7 @@ impl Web {
             }
             return fail("Wrong username or password.");
         };
-        self.delays.succeeded(username);
+        self.delays.succeeded(req.peer, username);
         let (id, secret) = self.broker.db.create_session(user.id)?;
         self.audit(Some(&user.username), "login", true, None, "");
         let mut resp = Resp::redirect(format!("/s/{secret}/repos"));
@@ -360,31 +366,41 @@ impl Web {
         Ok(Resp::page(body))
     }
 
+    /// Checks a password the logged-in user typed. `Err` is what to tell them instead.
+    fn own_password(
+        &self,
+        ctx: &Ctx,
+        password: &str,
+        action: &str,
+    ) -> Result<std::result::Result<(), String>> {
+        let (peer, name) = (ctx.req.peer, &ctx.user().username);
+        // Not counted as a failure: the password was not even looked at.
+        if let Some(wait) = self.delays.wait(peer, name) {
+            let seconds = wait.as_secs() + 1;
+            return Ok(Err(format!("Too many attempts. Try again in {seconds} seconds.")));
+        }
+        let stored = self.broker.db.password_hash(ctx.user().id)?;
+        if verify_password(password, stored.as_deref(), self.cost) {
+            self.delays.succeeded(peer, name);
+            self.broker.db.password_entered(ctx.id)?;
+            return Ok(Ok(()));
+        }
+        self.delays.failed(peer, name);
+        self.audit(Some(name), "password check", false, None, action);
+        Ok(Err("That was not the password.".into()))
+    }
+
     /// Asks for the password again unless it was entered a short while ago.
     fn fresh_password(&self, ctx: &Ctx, action: &str) -> Result<Option<Resp>> {
-        let entered = field(&ctx.req.form, "_password");
-        if entered.is_none() && now() - ctx.session.last_password <= PASSWORD_FRESH {
-            return Ok(None);
-        }
-        let name = &ctx.user().username;
-        let right = match entered {
-            Some(_) if self.delays.wait(name).is_some() => false,
-            Some(password) => {
-                let stored = self.broker.db.password_hash(ctx.user().id)?;
-                verify_password(password, stored.as_deref(), self.cost)
-            }
-            None => false,
+        let problem = match field(&ctx.req.form, "_password") {
+            None if now() - ctx.session.last_password <= PASSWORD_FRESH => return Ok(None),
+            None => None,
+            Some(password) => match self.own_password(ctx, password, action)? {
+                Ok(()) => return Ok(None),
+                Err(problem) => Some(problem),
+            },
         };
-        if right {
-            self.delays.succeeded(name);
-            self.broker.db.password_entered(ctx.id)?;
-            return Ok(None);
-        }
-        if entered.is_some() {
-            self.delays.failed(name);
-            self.audit(Some(name), "password check", false, None, action);
-        }
-        Ok(Some(Resp::page(ctx.frame().confirm(action, &ctx.req.form, entered.is_some()))))
+        Ok(Some(Resp::page(ctx.frame().confirm(action, &ctx.req.form, problem.as_deref()))))
     }
 
     fn change(&self, ctx: &Ctx, rest: &str) -> Result<Resp> {
@@ -414,6 +430,9 @@ impl Web {
         if let ["repos", id, "check"] = parts[..] {
             return self.check_repo(ctx, id.parse().unwrap_or(0));
         }
+        if parts == ["account", "password"] {
+            return self.change_password(ctx);
+        }
         // Everything else changes who can do what.
         if let Some(ask) = self.fresh_password(ctx, rest)? {
             return Ok(ask);
@@ -422,7 +441,6 @@ impl Web {
             ["repos", "add"] => self.add_repo(ctx),
             ["repos", id, action] => self.change_repo(ctx, id.parse().unwrap_or(0), action),
             ["accounts", uid, action] => self.change_account(ctx, uid.parse().unwrap_or(0), action),
-            ["account", "password"] => self.change_password(ctx),
             ["users", "add"] if ctx.user().is_admin => self.add_user(ctx),
             ["users", id, action] if ctx.user().is_admin => {
                 self.change_user(ctx, id.parse().unwrap_or(0), action)
@@ -490,13 +508,10 @@ impl Web {
                 )
             }
         };
-        self.audit(
-            Some(&user.username),
-            "repo added",
-            true,
-            Some(name),
-            &format!("entry {id}, prefix {prefix}"),
-        );
+        let row = db.repo_row(user.id, id)?;
+        let state = if row.enabled { "on" } else { "off: the token could not read the repo" };
+        let detail = format!("entry {id}, prefix {prefix}, {state}");
+        self.audit(Some(&user.username), "repo added", true, Some(&row.full_name), &detail);
         Ok(ctx.done("repos", &text))
     }
 
@@ -506,25 +521,33 @@ impl Web {
         let user = ctx.user();
         let row = db.repo_row(user.id, id)?;
         let token = db.repo_token(user.id, id)?;
-        match self.broker.github.look_up_repo(&row.full_name, &token) {
-            Ok((full_name, default_branch)) => {
-                if let Err(e) = Self::covers(&row.branch_prefix, &default_branch) {
-                    return Ok(ctx.back("repos", "err", e.public()));
-                }
-                db.set_repo_verified(user.id, id, &full_name, &default_branch)?;
-                // An entry that was never usable is switched on by its first good check.
-                let first = row.default_branch.is_empty();
-                if first {
-                    db.set_repo_enabled(user.id, id, true)?;
-                }
-                let on = if first { " The entry is now on." } else { "" };
-                Ok(ctx.done("repos", &format!("The token can read {full_name}.{on}")))
-            }
+        let (full_name, default_branch) = match self.broker.github.look_up_repo(&row.full_name, &token) {
+            Ok(found) => found,
             Err(e) => {
                 let why = scrub(e.public(), Some(&token));
-                Ok(ctx.back("repos", "err", &format!("The token could not read {}.\n{why}", row.full_name)))
+                return Ok(ctx.back(
+                    "repos",
+                    "err",
+                    &format!("The token could not read {}.\n{why}", row.full_name),
+                ));
             }
+        };
+        // What GitHub says now is what the rules are checked against, so it is stored first.
+        db.set_repo_verified(user.id, id, &full_name, &default_branch)?;
+        if let Err(e) = Self::covers(&row.branch_prefix, &default_branch) {
+            db.set_repo_enabled(user.id, id, false)?;
+            let detail = format!("switched off: prefix {} covers {default_branch}", row.branch_prefix);
+            self.audit(Some(&user.username), "repo rules changed", true, Some(&full_name), &detail);
+            let text = format!("{} The entry is switched off until the prefix is changed.", e.public());
+            return Ok(ctx.back("repos", "err", &text));
         }
+        // An entry that was never usable is switched on by its first good check.
+        let first = row.default_branch.is_empty();
+        if first {
+            db.set_repo_enabled(user.id, id, true)?;
+        }
+        let on = if first { " The entry is now on." } else { "" };
+        Ok(ctx.done("repos", &format!("The token can read {full_name}.{on}")))
     }
 
     fn change_repo(&self, ctx: &Ctx, id: i64, action: &str) -> Result<Resp> {
@@ -591,9 +614,11 @@ impl Web {
     }
 
     fn change_password(&self, ctx: &Ctx) -> Result<Resp> {
-        // The form always carries the current password, so `fresh_password` has checked it.
-        if field(&ctx.req.form, "_password").is_none() {
-            return refuse("Enter your current password.");
+        // Checked here and not through the confirm page, which would carry the new password
+        // along in its source.
+        let current = field(&ctx.req.form, "_password").unwrap_or_default();
+        if let Err(problem) = self.own_password(ctx, current, "account/password")? {
+            return refuse(problem);
         }
         let new = field(&ctx.req.form, "new").unwrap_or_default();
         if field(&ctx.req.form, "again") != Some(new) {

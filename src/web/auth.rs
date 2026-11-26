@@ -84,26 +84,34 @@ pub fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Slows down guessing per username. There is no lockout: a caller could use one to keep
-/// people out.
+/// Slows down guessing, per unix account that asks and username it asks for. There is no
+/// lockout, and one account's failures do not delay another's attempts: every local account
+/// can reach the login, so an agent could otherwise keep people out.
 #[derive(Default)]
 pub struct Delays {
-    failures: Mutex<HashMap<String, (u32, Instant)>>,
+    failures: Mutex<HashMap<(u32, String), (u32, Instant)>>,
 }
 
 const MAX_DELAY: Duration = Duration::from_secs(60);
 const MAX_TRACKED: usize = 10_000;
+/// Longer names are not names of users; see `check_username`.
+pub const MAX_USERNAME_BYTES: usize = 64;
 
 impl Delays {
-    /// How long the next attempt for this name still has to wait.
-    pub fn wait(&self, username: &str) -> Option<Duration> {
+    fn key(peer: u32, username: &str) -> Option<(u32, String)> {
+        (username.len() <= MAX_USERNAME_BYTES).then(|| (peer, username.to_string()))
+    }
+
+    /// How long the next attempt still has to wait.
+    pub fn wait(&self, peer: u32, username: &str) -> Option<Duration> {
         let failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
-        let (_, until) = failures.get(username)?;
+        let (_, until) = failures.get(&Self::key(peer, username)?)?;
         Some(until.saturating_duration_since(Instant::now())).filter(|d| !d.is_zero())
     }
 
     /// One second after the first failure, doubling up to a minute.
-    pub fn failed(&self, username: &str) {
+    pub fn failed(&self, peer: u32, username: &str) {
+        let Some(key) = Self::key(peer, username) else { return };
         let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         if failures.len() >= MAX_TRACKED {
@@ -112,7 +120,7 @@ impl Delays {
         if failures.len() >= MAX_TRACKED {
             failures.clear();
         }
-        let entry = failures.entry(username.to_string()).or_insert((0, now));
+        let entry = failures.entry(key).or_insert((0, now));
         // Long quiet: start over.
         if entry.1 + MAX_DELAY * 10 < now {
             entry.0 = 0;
@@ -122,8 +130,10 @@ impl Delays {
         entry.1 = now + delay;
     }
 
-    pub fn succeeded(&self, username: &str) {
-        self.failures.lock().unwrap_or_else(|e| e.into_inner()).remove(username);
+    pub fn succeeded(&self, peer: u32, username: &str) {
+        if let Some(key) = Self::key(peer, username) {
+            self.failures.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        }
     }
 }
 
@@ -154,17 +164,24 @@ mod tests {
     #[test]
     fn delays_grow_and_end() {
         let delays = Delays::default();
-        assert_eq!(delays.wait("a"), None);
-        delays.failed("a");
-        let first = delays.wait("a").unwrap();
+        assert_eq!(delays.wait(1, "a"), None);
+        delays.failed(1, "a");
+        let first = delays.wait(1, "a").unwrap();
         assert!(first <= Duration::from_secs(1));
         for _ in 0..10 {
-            delays.failed("a");
+            delays.failed(1, "a");
         }
-        let later = delays.wait("a").unwrap();
+        let later = delays.wait(1, "a").unwrap();
         assert!(later > Duration::from_secs(50) && later <= MAX_DELAY);
-        assert_eq!(delays.wait("b"), None, "per name");
-        delays.succeeded("a");
-        assert_eq!(delays.wait("a"), None);
+        assert_eq!(delays.wait(1, "b"), None, "per name");
+        assert_eq!(delays.wait(2, "a"), None, "per account that asks");
+        delays.succeeded(2, "a");
+        assert!(delays.wait(1, "a").is_some());
+        delays.succeeded(1, "a");
+        assert_eq!(delays.wait(1, "a"), None);
+        // Names that cannot be usernames are not kept.
+        let long = "x".repeat(MAX_USERNAME_BYTES + 1);
+        delays.failed(1, &long);
+        assert!(delays.failures.lock().unwrap().is_empty());
     }
 }

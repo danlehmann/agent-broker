@@ -341,7 +341,7 @@ impl Frame<'_> {
     }
 
     /// Asks for the password again before a sensitive change, keeping what was submitted.
-    pub fn confirm(&self, action: &str, fields: &[(String, String)], wrong: bool) -> String {
+    pub fn confirm(&self, action: &str, fields: &[(String, String)], problem: Option<&str>) -> String {
         let mut inner = String::new();
         for (name, value) in fields.iter().filter(|(n, _)| n != "_password" && n != "_csrf") {
             // No page gives a token back, not even the one that was just typed.
@@ -362,11 +362,10 @@ impl Frame<'_> {
             "<label>Your password</label><input type=\"password\" name=\"_password\" required autofocus>\
              <br><button>Continue</button>",
         );
-        let err = wrong.then_some("That was not the password.");
         let body = format!(
             "{}<h1>Confirm with your password</h1><section><p>This changes who can do what, so it \
              needs your password again.</p>{}</section>",
-            notices(None, err),
+            notices(None, problem),
             self.form(action, "", &inner)
         );
         let plain = Frame { ok: None, err: None, ..*self };
