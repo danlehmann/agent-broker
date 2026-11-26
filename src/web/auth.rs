@@ -1,7 +1,7 @@
 //! Passwords and the delay after failed logins.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -23,7 +23,41 @@ impl Default for Cost {
     }
 }
 
+/// Hashing takes memory and time on purpose, and anyone on the machine can ask for it by trying
+/// to log in. So only this many run at once; the rest wait their turn.
+const HASHES_AT_ONCE: usize = 2;
+/// A stored hash asking for more than this is not one of ours.
+const MAX_MEMORY_KIB: u32 = 1024 * 1024;
+const MAX_PASSES: u32 = 64;
+
+static HASHING: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+struct Turn;
+
+impl Turn {
+    fn wait() -> Turn {
+        let (running, freed) = &HASHING;
+        let mut running = running.lock().unwrap_or_else(|e| e.into_inner());
+        while *running >= HASHES_AT_ONCE {
+            running = freed.wait(running).unwrap_or_else(|e| e.into_inner());
+        }
+        *running += 1;
+        Turn
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        *HASHING.0.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        HASHING.1.notify_one();
+    }
+}
+
 fn argon2id(password: &str, salt: &[u8], memory_kib: u32, passes: u32) -> Option<Vec<u8>> {
+    if memory_kib > MAX_MEMORY_KIB || passes > MAX_PASSES {
+        return None;
+    }
+    let _turn = Turn::wait();
     let params = Params::new(memory_kib, passes, 1, Some(32)).ok()?;
     let mut out = vec![0; 32];
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
@@ -89,50 +123,70 @@ pub fn same(a: &[u8], b: &[u8]) -> bool {
 /// can reach the login, so an agent could otherwise keep people out.
 #[derive(Default)]
 pub struct Delays {
-    failures: Mutex<HashMap<(u32, String), (u32, Instant)>>,
+    failures: Mutex<HashMap<u32, Asker>>,
+}
+
+/// (failures in a row, when the next attempt may come)
+type Failures = (u32, Instant);
+
+/// What one unix account got wrong.
+#[derive(Default)]
+struct Asker {
+    names: HashMap<String, Failures>,
+    /// For every further name once `names` is full, so that trying many names neither grows
+    /// the table nor pushes a delay out of it.
+    others: Option<Failures>,
 }
 
 const MAX_DELAY: Duration = Duration::from_secs(60);
-const MAX_TRACKED: usize = 10_000;
+const QUIET: Duration = Duration::from_secs(600);
+const MAX_NAMES_PER_ASKER: usize = 100;
 /// Longer names are not names of users; see `check_username`.
 pub const MAX_USERNAME_BYTES: usize = 64;
 
-impl Delays {
-    fn key(peer: u32, username: &str) -> Option<(u32, String)> {
-        (username.len() <= MAX_USERNAME_BYTES).then(|| (peer, username.to_string()))
+fn count(entry: &mut Failures, now: Instant) {
+    // Long quiet: start over.
+    if entry.1 + QUIET < now {
+        entry.0 = 0;
     }
+    entry.0 = entry.0.saturating_add(1);
+    entry.1 = now + Duration::from_secs(1u64 << (entry.0 - 1).min(6)).min(MAX_DELAY);
+}
 
+impl Delays {
     /// How long the next attempt still has to wait.
     pub fn wait(&self, peer: u32, username: &str) -> Option<Duration> {
         let failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
-        let (_, until) = failures.get(&Self::key(peer, username)?)?;
+        let asker = failures.get(&peer)?;
+        let (_, until) = asker.names.get(username).or(asker.others.as_ref())?;
         Some(until.saturating_duration_since(Instant::now())).filter(|d| !d.is_zero())
     }
 
     /// One second after the first failure, doubling up to a minute.
     pub fn failed(&self, peer: u32, username: &str) {
-        let Some(key) = Self::key(peer, username) else { return };
+        if username.len() > MAX_USERNAME_BYTES {
+            return;
+        }
         let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        if failures.len() >= MAX_TRACKED {
-            failures.retain(|_, (_, until)| *until + MAX_DELAY * 10 > now);
+        let asker = failures.entry(peer).or_default();
+        if !asker.names.contains_key(username) && asker.names.len() >= MAX_NAMES_PER_ASKER {
+            asker.names.retain(|_, (_, until)| *until + QUIET > now);
         }
-        if failures.len() >= MAX_TRACKED {
-            failures.clear();
+        if !asker.names.contains_key(username) && asker.names.len() >= MAX_NAMES_PER_ASKER {
+            count(asker.others.get_or_insert((0, now)), now);
+            return;
         }
-        let entry = failures.entry(key).or_insert((0, now));
-        // Long quiet: start over.
-        if entry.1 + MAX_DELAY * 10 < now {
-            entry.0 = 0;
-        }
-        entry.0 = entry.0.saturating_add(1);
-        let delay = Duration::from_secs(1u64 << (entry.0 - 1).min(6)).min(MAX_DELAY);
-        entry.1 = now + delay;
+        count(asker.names.entry(username.to_string()).or_insert((0, now)), now);
     }
 
     pub fn succeeded(&self, peer: u32, username: &str) {
-        if let Some(key) = Self::key(peer, username) {
-            self.failures.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(asker) = failures.get_mut(&peer) {
+            asker.names.remove(username);
+            if asker.names.is_empty() {
+                failures.remove(&peer);
+            }
         }
     }
 }
@@ -183,5 +237,46 @@ mod tests {
         let long = "x".repeat(MAX_USERNAME_BYTES + 1);
         delays.failed(1, &long);
         assert!(delays.failures.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn many_names_do_not_shake_off_a_delay() {
+        let delays = Delays::default();
+        for _ in 0..5 {
+            delays.failed(1, "alice");
+        }
+        delays.failed(2, "alice");
+        for n in 0..MAX_NAMES_PER_ASKER * 3 {
+            delays.failed(1, &format!("name{n}"));
+        }
+        assert!(delays.wait(1, "alice").unwrap() > Duration::from_secs(10), "still delayed");
+        assert!(delays.wait(2, "alice").is_some(), "another account's delay is untouched");
+        assert!(delays.wait(1, "never tried").is_some(), "further names share one delay");
+        assert_eq!(delays.wait(3, "never tried"), None);
+        assert!(delays.failures.lock().unwrap()[&1].names.len() <= MAX_NAMES_PER_ASKER);
+    }
+
+    #[test]
+    fn only_a_few_hashes_run_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static MOST: AtomicUsize = AtomicUsize::new(0);
+        let threads: Vec<_> = (0..12)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let _turn = Turn::wait();
+                    MOST.fetch_max(*HASHING.0.lock().unwrap(), Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(5));
+                })
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        let most = MOST.load(Ordering::SeqCst);
+        assert!((1..=HASHES_AT_ONCE).contains(&most), "{most}");
+    }
+
+    #[test]
+    fn a_stored_hash_cannot_ask_for_any_amount_of_work() {
+        let huge = format!("argon2id${}$1$AAAAAAAAAAAAAAAAAAAAAA$AAAA", u32::MAX);
+        assert!(!verify_password("x", Some(&huge), CHEAP));
     }
 }

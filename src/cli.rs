@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use serde_json::json;
 
 use crate::daemon;
-use crate::db::Db;
+use crate::db::{AuditEntry, Db};
 use crate::platform;
 use crate::shim::{Client, Shim};
 
@@ -126,6 +126,14 @@ fn reset_login(flags: &Flags, username: &str) -> Outcome {
     let fail = |e: crate::error::Error| e.to_string();
     let user = db.user_id(username).map_err(fail)?.ok_or("no such user")?;
     let token = db.new_one_time_link(user, "reset").map_err(fail)?;
+    let entry = AuditEntry {
+        event: "reset link made",
+        uid: Some(nix::unistd::getuid().as_raw()),
+        ok: Some(true),
+        detail: &format!("for {username}, on the command line"),
+        ..Default::default()
+    };
+    db.audit(&entry).map_err(fail)?;
     println!(
         "{}\nOpen this link within 15 minutes and set the password. It works once:\n\n    \
          http://localhost:8443/setup/{token}\n",

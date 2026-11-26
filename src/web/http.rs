@@ -245,7 +245,7 @@ pub fn serve(web: Arc<Web>, listener: UnixListener) {
             continue;
         };
         let web = web.clone();
-        std::thread::spawn(move || {
+        let serving = std::thread::Builder::new().spawn(move || {
             let _slot = slot;
             let req = read(&stream, peer);
             let resp = match &req {
@@ -257,6 +257,9 @@ pub fn serve(web: Arc<Web>, listener: UnixListener) {
                 let _ = drain(&stream);
             }
         });
+        if let Err(e) = serving {
+            log(&format!("web: cannot start a thread: {e}"), None);
+        }
     }
 }
 

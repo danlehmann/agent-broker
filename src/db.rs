@@ -195,6 +195,8 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        // A replaced or deleted token does not stay behind in the file's free pages.
+        conn.pragma_update(None, "secure_delete", true)?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if !(0..=SCHEMA_VERSION).contains(&version) {
@@ -342,6 +344,21 @@ impl Db {
     ) -> Result<i64> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let id =
+            Self::insert_github_repo(&tx, user_id, token, full_name, branch_prefix, default_branch, tools)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub(crate) fn insert_github_repo(
+        tx: &rusqlite::Transaction,
+        user_id: i64,
+        token: &str,
+        full_name: &str,
+        branch_prefix: &str,
+        default_branch: &str,
+        tools: &[&str],
+    ) -> Result<i64> {
         let duplicate: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM github_repo_entries g JOIN resources r
              ON r.id = g.resource_id WHERE r.user_id = ?1 AND g.full_name = ?2)",
@@ -367,7 +384,6 @@ impl Db {
             "INSERT INTO github_repo_entries VALUES (?1, ?2, ?3, ?4)",
             params![resource, full_name, branch_prefix, default_branch],
         )?;
-        tx.commit()?;
         Ok(resource)
     }
 

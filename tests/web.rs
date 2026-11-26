@@ -162,8 +162,86 @@ fn a_password_is_set_through_a_link_that_works_once() {
     let stale = db.new_one_time_link(alice, "reset").unwrap();
     db.conn().execute("UPDATE one_time_links SET expires = 1", []).unwrap();
     assert_eq!(s.request("GET", &format!("/setup/{stale}"), "", &[]).status, 404);
-    s.login("alice", PASSWORD);
+    let alice_browser = s.login("alice", PASSWORD);
     assert!(!s.audit().contains(PASSWORD));
+    // Asking for a link ends the user's sessions at once, not only when the link is used.
+    assert_eq!(s.get(&alice_browser, "repos").status, 200);
+    db.new_one_time_link(alice, "reset").unwrap();
+    assert_eq!(s.get(&alice_browser, "repos").status, 303);
+}
+
+#[test]
+fn a_replacement_token_that_cannot_read_the_repo_switches_the_entry_off() {
+    let s = Site::new();
+    let alice = s.user("alice");
+    let id = s.repo_id("alice", "o/a");
+    let row = || s.w.broker.db.repo_row(s.w.broker.db.user_id("alice").unwrap().unwrap(), id).unwrap();
+    assert!(s.w.ok("github_repos", json!({})).contains("o/a"));
+    s.w.api.raw("GET /repos/o/a", 401, "", "{\"message\":\"Bad credentials\"}");
+    let page = s.done(&alice, &format!("repos/{id}/token"), &[("token", "ghp_REVOKED")]);
+    assert!(page.contains("could not read o/a") && page.contains("the entry is switched off"), "{page}");
+    assert!(!page.contains("ghp_REVOKED"));
+    assert!(!row().enabled && row().last_verified.is_none());
+    assert!(!s.w.ok("github_repos", json!({})).contains("o/a"), "agents no longer see it");
+    // A check that fails changes nothing; one that works says so, and its owner switches it on.
+    assert!(s.done(&alice, &format!("repos/{id}/check"), &[]).contains("could not read o/a"));
+    s.w.api.on("GET /repos/o/a", json!({"full_name": "o/a", "default_branch": "main"}));
+    let page = s.done(&alice, &format!("repos/{id}/check"), &[]);
+    assert!(page.contains("The token can read o/a. The entry is off; switch it on in its rules."), "{page}");
+    assert!(!row().enabled && row().last_verified.is_some());
+    s.done(&alice, &format!("repos/{id}/edit"), &[("prefix", "daniel/"), ("enabled", "1")]);
+    assert!(s.w.ok("github_repos", json!({})).contains("o/a"));
+    // All of it is in the audit log, with the unix account the browser came from.
+    let rows = s.w.broker.db.audit_rows().unwrap();
+    let seen: Vec<_> = rows
+        .iter()
+        .filter(|r| r["resource"] == "o/a" && r["uid"] == HUMAN)
+        .map(|r| (r["event"].as_str().unwrap(), r["ok"].as_bool().unwrap(), r["detail"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("token replaced", false, "could not read the repo; entry switched off"),
+            ("token checked", false, "could not read the repo"),
+            ("token checked", true, "entry off"),
+            ("repo rules changed", true, "prefix daniel/, enabled true, tools "),
+        ]
+    );
+    // So is a change that was refused.
+    s.done(&alice, &format!("repos/{id}/edit"), &[("prefix", "m")]);
+    let rows = s.w.broker.db.audit_rows().unwrap();
+    let refused = rows.iter().find(|r| r["event"] == "change refused").unwrap();
+    assert!(refused["detail"].as_str().unwrap().contains("would cover the default branch main"));
+}
+
+#[test]
+fn rules_are_held_against_what_is_stored_at_that_moment() {
+    use agent_broker::web::store::{Checked, UserChange};
+    let s = Site::new();
+    let db = &s.w.broker.db;
+    let alice = db.user_id("alice").unwrap().unwrap();
+    let id = s.repo_id("alice", "o/a");
+    // A check that finds the default branch under the prefix switches the entry off, and a
+    // form filled in before that cannot switch it on again.
+    assert!(matches!(
+        db.set_repo_checked(alice, id, None, "o/a", "daniel/main").unwrap(),
+        Checked::Covered(prefix) if prefix == "daniel/"
+    ));
+    assert!(db.update_repo(alice, id, "daniel/", &[], true).is_err());
+    assert!(!db.repo_row(alice, id).unwrap().enabled);
+    assert!(matches!(db.set_repo_checked(alice, id, None, "o/a", "main").unwrap(), Checked::Off));
+
+    // Two admins cannot take each other away: the second change finds no admin left and
+    // is undone as a whole.
+    let bob = db.user_id("bob").unwrap().unwrap();
+    db.change_user(bob, UserChange::Admin(true)).unwrap();
+    db.change_user(alice, UserChange::Admin(false)).unwrap();
+    for change in [UserChange::Admin(false), UserChange::Disable, UserChange::Delete] {
+        assert!(db.change_user(bob, change).is_err());
+    }
+    let bob = db.user(bob).unwrap().unwrap();
+    assert!(bob.is_admin && !bob.disabled);
+    assert!(db.change_user(9999, UserChange::Enable).is_err(), "no such user");
 }
 
 #[test]
@@ -300,6 +378,7 @@ fn a_change_needs_our_origin_our_host_and_the_form_token() {
         (Some("https://localhost:8443"), HOST, &csrf, 403),
         (Some("null"), HOST, &csrf, 403),
         (Some(ours.as_str()), "evil.example", &csrf, 400),
+        (Some("http://localhost:"), "localhost:", &csrf, 400),
         (Some("http://evil.example"), "evil.example", &csrf, 400),
         (Some(&ours), HOST, "", 403),
         (Some(&ours), HOST, &"0".repeat(64), 403),
@@ -323,14 +402,11 @@ fn repos_are_set_up_in_the_browser_and_tokens_never_come_back() {
     let alice = s.user("alice");
     let token = "github_pat_NEWTOKEN123";
     let form = |repo: &'static str, token: &'static str, prefix: &'static str| {
-        vec![
-            ("repo", repo),
-            ("token", token),
-            ("prefix", prefix),
-            ("tool", "github_push"),
-            ("tool", "made_up"),
-        ]
+        vec![("repo", repo), ("token", token), ("prefix", prefix), ("tool", "github_push")]
     };
+    let mut made_up = form("o/new", token, "al/");
+    made_up.push(("tool", "made_up"));
+    assert!(s.done(&alice, "repos/add", &made_up).contains("There is no tool made_up."));
     // Nothing is stored for a token that cannot be one, or for rules that make no sense.
     assert!(
         s.done(&alice, "repos/add", &form("o/new", "not a token!", "al/"))
@@ -481,11 +557,20 @@ fn sensitive_changes_ask_for_the_password_again() {
     s.w.broker.db.conn().execute("UPDATE sessions SET last_password = last_password - 301", []).unwrap();
     assert_eq!(s.get(&alice, "repos").status, 200);
     assert!(s.post(&alice, "accounts/code", &[]).body.contains("Link code:"));
-    for action in
-        ["repos/add", "accounts/5001/unlink", "accounts/5001/limits", "accounts/5001/confirm", "users/add"]
-    {
+    let check = format!("repos/{id}/check");
+    for action in [
+        "repos/add",
+        check.as_str(),
+        "accounts/5001/unlink",
+        "accounts/5001/limits",
+        "accounts/5001/confirm",
+        "users/add",
+    ] {
         assert!(s.post(&alice, action, &[]).body.contains("Confirm with your password"), "{action}");
     }
+    // The page that asks is built from the request's path, which is not trusted.
+    let ask = s.post(&alice, "repos/1/x\"><b>y", &[]).body;
+    assert!(ask.contains("Confirm with your password") && !ask.contains("x\"><b>y"), "{}", text(&ask));
     // A token that was typed is asked for again, not sent back in the page.
     let ask =
         s.post(&alice, "repos/add", &[("repo", "o/new"), ("token", "ghp_TYPED"), ("prefix", "al/")]).body;

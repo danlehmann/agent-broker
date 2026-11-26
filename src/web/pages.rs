@@ -98,8 +98,9 @@ impl Frame<'_> {
 
     fn form(&self, action: &str, class: &str, inner: &str) -> String {
         format!(
-            "<form method=\"post\" action=\"{}/{action}\" class=\"{class}\">{}{inner}</form>",
+            "<form method=\"post\" action=\"{}/{}\" class=\"{class}\">{}{inner}</form>",
             self.base,
+            esc(action),
             self.csrf_field()
         )
     }

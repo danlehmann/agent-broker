@@ -4,6 +4,7 @@ use rusqlite::{OptionalExtension, Row, params};
 
 use crate::db::{Db, hash_secret, now, random_base32};
 use crate::error::{Result, refuse};
+use crate::github::rules::check_prefix_spares;
 
 const IDLE: i64 = 30 * 60;
 const LIFETIME: i64 = 12 * 60 * 60;
@@ -66,6 +67,23 @@ pub struct AuditRow {
     pub detail: String,
 }
 
+/// What a successful token check left the entry as.
+pub enum Checked {
+    On,
+    Off,
+    /// It had never been usable, and is switched on now.
+    FirstOn,
+    /// Switched off: this prefix covers what is the default branch now.
+    Covered(String),
+}
+
+pub enum UserChange {
+    Disable,
+    Enable,
+    Admin(bool),
+    Delete,
+}
+
 /// 256 random bits, as 52 base32 characters.
 fn secret() -> String {
     random_base32(52)
@@ -106,6 +124,16 @@ impl Db {
             .flatten())
     }
 
+    /// Creates a user who can log in at once.
+    pub fn add_user_with_password(&self, username: &str, is_admin: bool, hash: &str) -> Result<i64> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO users (username, is_admin, password_hash) VALUES (?1, ?2, ?3)",
+            params![username, is_admin, hash],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
     /// Sets the password and ends every session of the user but `keep`.
     pub fn set_password(&self, user_id: i64, hash: &str, keep: Option<&str>) -> Result<()> {
         let mut conn = self.conn();
@@ -123,7 +151,10 @@ impl Db {
     pub fn create_session(&self, user_id: i64) -> Result<(String, String)> {
         let (id, url_secret) = (secret(), secret());
         let conn = self.conn();
-        conn.execute("DELETE FROM sessions WHERE created < ?1", [now() - LIFETIME])?;
+        conn.execute(
+            "DELETE FROM sessions WHERE created < ?1 OR last_seen < ?2",
+            params![now() - LIFETIME, now() - IDLE],
+        )?;
         conn.execute(
             "INSERT INTO sessions VALUES (?1, ?2, ?3, ?4, ?4, ?4)",
             params![hash_secret(&id), hash_secret(&url_secret), user_id, now()],
@@ -168,18 +199,20 @@ impl Db {
         Ok(())
     }
 
-    /// A single-use link token to set a password. Earlier unused ones of the user end.
+    /// A single-use link token to set a password. Earlier unused ones of the user end, and so
+    /// do the user's sessions: a link is asked for when the password is lost or no longer
+    /// trusted, and then whoever is logged in with it should not stay.
     pub fn new_one_time_link(&self, user_id: i64, purpose: &str) -> Result<String> {
         let token = secret();
-        let conn = self.conn();
-        conn.execute(
-            "DELETE FROM one_time_links WHERE user_id = ?1 OR expires < ?2",
-            params![user_id, now()],
-        )?;
-        conn.execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM one_time_links WHERE user_id = ?1 OR expires < ?2", params![user_id, now()])?;
+        tx.execute("DELETE FROM sessions WHERE user_id = ?1", [user_id])?;
+        tx.execute(
             "INSERT INTO one_time_links (token_hash, user_id, purpose, expires) VALUES (?1, ?2, ?3, ?4)",
             params![hash_secret(&token), user_id, purpose, now() + LINK_LIFETIME],
         )?;
+        tx.commit()?;
         Ok(token)
     }
 
@@ -269,6 +302,46 @@ impl Db {
         token.map_or_else(|| refuse("no such repo entry"), Ok)
     }
 
+    /// Adds a repo entry. Without GitHub's word on the default branch the token could not
+    /// read the repo, and the entry starts switched off.
+    pub fn add_repo(
+        &self,
+        user_id: i64,
+        token: &str,
+        full_name: &str,
+        prefix: &str,
+        default_branch: Option<&str>,
+        tools: &[&str],
+    ) -> Result<i64> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if let Some(default_branch) = default_branch {
+            check_prefix_spares(prefix, default_branch)?;
+        }
+        let id = Self::insert_github_repo(
+            &tx,
+            user_id,
+            token,
+            full_name,
+            prefix,
+            default_branch.unwrap_or(""),
+            tools,
+        )?;
+        match default_branch {
+            Some(_) => tx.execute(
+                "UPDATE credentials SET last_verified = ?2
+                 WHERE id = (SELECT credential_id FROM resources WHERE id = ?1)",
+                params![id, now()],
+            )?,
+            None => tx.execute("UPDATE resources SET enabled = 0 WHERE id = ?1", [id])?,
+        };
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Changes an entry's rules. The prefix is checked here, against the default branch as it
+    /// is stored at this moment, so that a token check running at the same time cannot be
+    /// overruled by what a form was filled in with earlier.
     pub fn update_repo(
         &self,
         user_id: i64,
@@ -279,13 +352,23 @@ impl Db {
     ) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let changed = tx.execute(
+        let default_branch: Option<String> = tx
+            .query_row(
+                "SELECT g.default_branch FROM github_repo_entries g JOIN resources r ON r.id = g.resource_id
+                 WHERE r.user_id = ?1 AND r.id = ?2",
+                params![user_id, id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(default_branch) = default_branch else { return refuse("no such repo entry") };
+        check_prefix_spares(prefix, &default_branch)?;
+        if enabled && default_branch.is_empty() {
+            return refuse("This entry stays off until \"Check the token\" succeeds.");
+        }
+        tx.execute(
             "UPDATE resources SET enabled_tools = ?3, enabled = ?4 WHERE user_id = ?1 AND id = ?2",
             params![user_id, id, tools.join(" "), enabled],
         )?;
-        if changed == 0 {
-            return refuse("no such repo entry");
-        }
         tx.execute(
             "UPDATE github_repo_entries SET branch_prefix = ?2 WHERE resource_id = ?1",
             params![id, prefix],
@@ -294,16 +377,12 @@ impl Db {
         Ok(())
     }
 
-    pub fn set_repo_enabled(&self, user_id: i64, id: i64, enabled: bool) -> Result<()> {
-        self.conn().execute(
-            "UPDATE resources SET enabled = ?3 WHERE user_id = ?1 AND id = ?2",
-            params![user_id, id, enabled],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_repo_token(&self, user_id: i64, id: i64, token: &str) -> Result<()> {
-        let changed = self.conn().execute(
+    /// Stores a replacement token that could not read the repo. The old one is gone, so the
+    /// entry is switched off until a check succeeds and its owner switches it on again.
+    pub fn set_unchecked_token(&self, user_id: i64, id: i64, token: &str) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
             "UPDATE credentials SET token = ?3, last_verified = NULL
              WHERE id = (SELECT credential_id FROM resources WHERE user_id = ?1 AND id = ?2)",
             params![user_id, id, token],
@@ -311,23 +390,28 @@ impl Db {
         if changed == 0 {
             return refuse("no such repo entry");
         }
+        tx.execute("UPDATE resources SET enabled = 0 WHERE id = ?1", [id])?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Records what GitHub said about the repo when the token was last checked.
-    pub fn set_repo_verified(
+    /// Records what GitHub said about the repo when a token could read it: the stored one, or
+    /// `new_token`, which then replaces it. The entry's rules are held against that answer in
+    /// the same step.
+    pub fn set_repo_checked(
         &self,
         user_id: i64,
         id: i64,
+        new_token: Option<&str>,
         full_name: &str,
         default_branch: &str,
-    ) -> Result<()> {
+    ) -> Result<Checked> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let changed = tx.execute(
-            "UPDATE credentials SET last_verified = ?3, label = ?4
+            "UPDATE credentials SET last_verified = ?3, label = ?4, token = coalesce(?5, token)
              WHERE id = (SELECT credential_id FROM resources WHERE user_id = ?1 AND id = ?2)",
-            params![user_id, id, now(), full_name],
+            params![user_id, id, now(), full_name, new_token],
         )?;
         if changed == 0 {
             return refuse("no such repo entry");
@@ -344,12 +428,28 @@ impl Db {
                 "GitHub calls this repo {full_name} now, and there is another entry for that. Delete one of the two."
             ));
         }
+        let (prefix, was_default, enabled): (String, String, bool) = tx.query_row(
+            "SELECT g.branch_prefix, g.default_branch, r.enabled
+             FROM github_repo_entries g JOIN resources r ON r.id = g.resource_id WHERE r.id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
         tx.execute(
             "UPDATE github_repo_entries SET full_name = ?2, default_branch = ?3 WHERE resource_id = ?1",
             params![id, full_name, default_branch],
         )?;
+        let (checked, on) = if check_prefix_spares(&prefix, default_branch).is_err() {
+            (Checked::Covered(prefix), false)
+        } else if was_default.is_empty() {
+            (Checked::FirstOn, true)
+        } else if enabled {
+            (Checked::On, true)
+        } else {
+            (Checked::Off, false)
+        };
+        tx.execute("UPDATE resources SET enabled = ?2 WHERE id = ?1", params![id, on])?;
         tx.commit()?;
-        Ok(())
+        Ok(checked)
     }
 
     pub fn delete_repo(&self, user_id: i64, id: i64) -> Result<()> {
@@ -474,39 +574,41 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn set_user_disabled(&self, id: i64, disabled: bool) -> Result<()> {
-        let conn = self.conn();
-        conn.execute("UPDATE users SET disabled = ?2 WHERE id = ?1", params![id, disabled])?;
-        if disabled {
-            conn.execute("DELETE FROM sessions WHERE user_id = ?1", [id])?;
-        }
-        Ok(())
-    }
-
-    pub fn set_user_admin(&self, id: i64, is_admin: bool) -> Result<()> {
-        self.conn().execute("UPDATE users SET is_admin = ?2 WHERE id = ?1", params![id, is_admin])?;
-        Ok(())
-    }
-
-    /// Deletes a user. Their audit entries stay, under a name no later user can have: someone
-    /// who is given the same username must not find them in their own log.
-    pub fn delete_user(&self, id: i64) -> Result<()> {
+    /// Changes or deletes a user. Someone must remain who can manage users, and that is
+    /// looked at in the same step as the change: two admins cannot remove each other.
+    ///
+    /// A deleted user's audit entries stay, under a name no later user can have: someone who
+    /// is given the same username must not find them in their own log.
+    pub fn change_user(&self, id: i64, change: UserChange) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        tx.execute(
-            "UPDATE audit SET username = username || ' (deleted)'
-             WHERE username = (SELECT username FROM users WHERE id = ?1)",
-            [id],
-        )?;
-        tx.execute("DELETE FROM users WHERE id = ?1", [id])?;
+        let changed = match change {
+            UserChange::Disable => {
+                tx.execute("DELETE FROM sessions WHERE user_id = ?1", [id])?;
+                tx.execute("UPDATE users SET disabled = 1 WHERE id = ?1", [id])?
+            }
+            UserChange::Enable => tx.execute("UPDATE users SET disabled = 0 WHERE id = ?1", [id])?,
+            UserChange::Admin(is_admin) => {
+                tx.execute("UPDATE users SET is_admin = ?2 WHERE id = ?1", params![id, is_admin])?
+            }
+            UserChange::Delete => {
+                tx.execute(
+                    "UPDATE audit SET username = username || ' (deleted)'
+                     WHERE username = (SELECT username FROM users WHERE id = ?1)",
+                    [id],
+                )?;
+                tx.execute("DELETE FROM users WHERE id = ?1", [id])?
+            }
+        };
+        if changed == 0 {
+            return refuse("no such user");
+        }
+        let admins: i64 =
+            tx.query_row("SELECT count(*) FROM users WHERE is_admin AND NOT disabled", [], |r| r.get(0))?;
+        if admins == 0 {
+            return refuse("That would leave no admin.");
+        }
         tx.commit()?;
         Ok(())
-    }
-
-    /// Admins who can log in.
-    pub fn active_admins(&self) -> Result<i64> {
-        Ok(self
-            .conn()
-            .query_row("SELECT count(*) FROM users WHERE is_admin AND NOT disabled", [], |r| r.get(0))?)
     }
 }

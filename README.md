@@ -35,7 +35,7 @@ socket), authenticator-app codes for logging in, and a build on macOS.
 5. Give the agent's harness the MCP server `{"command": "agent-broker", "args": ["mcp"]}`.
 
 If you are locked out, `agent-broker reset-login USERNAME`, run as the daemon's account, prints
-a one-time link to set a new password.
+a one-time link to set a new password. Making the link logs that user out everywhere at once.
 
 ## Layout
 

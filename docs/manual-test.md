@@ -47,7 +47,13 @@ interface. Open the link, create the first admin (`YOU`) and log in. Then, in th
       profile that has the link of a logged-in page but no cookie gets the login page.
 - [ ] No page shows a token, and `sudo grep -c` for the session cookie's value in
       `~BROKER/data/broker.db*` finds nothing.
-- [ ] `b reset-login YOU` prints a link that sets a new password and ends the old sessions.
+- [ ] `b reset-login YOU` prints a link that sets a new password. A page that was logged in
+      as YOU asks for the login again as soon as the link is printed, before it is used.
+- [ ] In a real browser, every form works: add a repo, change its rules, check and replace
+      its token, get and confirm a link code, change the password. None answers "this
+      request did not come from the broker's own page".
+- [ ] Replace a repo's token with one that is revoked: the entry shows as off, and the agent
+      no longer lists the repo.
 - [ ] Starting the daemon with sudo as root, with a data dir of mode 755, or twice is refused.
 - [ ] Deleting and recreating A under the same uid but another name makes it unlinked.
 
