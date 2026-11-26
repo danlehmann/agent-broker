@@ -5,7 +5,7 @@ Lets AI coding agents use GitHub without ever holding a GitHub token.
 A daemon under its own unix account holds the tokens. Agents run under other accounts on the
 same machine and reach it through `agent-broker mcp`, an MCP server over stdio. The daemon
 identifies the caller by its unix account and enforces rules that GitHub's token permissions
-cannot express, such as "only branches starting with `daniel/`" and "pull requests are always
+cannot express, such as "only branches starting with `yourname/`" and "pull requests are always
 drafts".
 
 It protects the tokens and limits what can be done with them through the broker. It does
