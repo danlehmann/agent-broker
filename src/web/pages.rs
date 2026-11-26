@@ -149,6 +149,11 @@ impl Frame<'_> {
                  <input type=\"password\" name=\"token\" autocomplete=\"off\" required> <button>Replace</button>";
             let upstream = match repo.upstream.as_str() {
                 "" => String::new(),
+                upstream if repo.upstream_default.is_empty() => format!(
+                    "<p>Added as a fork of <code>{}</code>, but GitHub no longer names that repo as \
+                     the one this was forked from. The entry stays off; delete it and add the repo again.</p>",
+                    esc(upstream)
+                ),
                 upstream => format!(
                     "<p>A fork: pull requests go to <code>{}</code>, default branch <code>{}</code>.</p>",
                     esc(upstream),

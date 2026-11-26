@@ -20,12 +20,15 @@ impl GitHub {
         let lock = self.lock(entry.resource_id);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mirror = self.mirror(entry)?;
+        // The default branch of a fork entry is that of the repo it came from, whatever its name.
+        let mut from = None;
         let branch = match branch {
             Some(b) => b.to_string(),
             None => {
-                let from = mirror.upstream().unwrap_or("origin".into());
+                let asked = mirror.upstream().unwrap_or("origin".into());
                 let out =
-                    mirror.git_auth_or("cannot reach GitHub", &["ls-remote", "--symref", &from, "HEAD"])?;
+                    mirror.git_auth_or("cannot reach GitHub", &["ls-remote", "--symref", &asked, "HEAD"])?;
+                from = Some(asked);
                 let name = out
                     .lines()
                     .filter_map(|l| l.strip_prefix("ref: refs/heads/")?.split_once('\t'))
@@ -41,7 +44,7 @@ impl GitHub {
 
         let name = fetched_ref(&branch);
         let spec = format!("+refs/heads/{branch}:{name}");
-        let from = mirror.source(&branch);
+        let from = from.unwrap_or_else(|| mirror.source(&branch));
         let done =
             mirror.git_auth(&["fetch", "--no-tags", "--quiet", "--no-write-fetch-head", &from, &spec])?;
         if !done.ok {

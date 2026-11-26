@@ -126,8 +126,40 @@ fn a_fork_takes_pushes_and_the_repo_it_came_from_gives_the_rest() {
     git(&dir, &["reset", "-q", "--hard", "origin/main"]);
     w.commit(&dir, "rewritten");
     let (text, is_error) = w.push(&dir, true);
-    assert!(is_error && text.contains("had gone into main"), "{text}");
+    assert!(is_error && text.contains("had gone into the default branch of up/a"), "{text}");
     assert_eq!(w.hub_ref("o/a", "daniel/x"), Some(theirs));
+
+    // Work that went into up/a some other way, squashed or into another branch, shows in its
+    // pull requests only. Here someone added to the agent's branch, which alone is fine.
+    git(&dir, &["checkout", "-q", "-b", "daniel/y", "origin/main"]);
+    w.commit(&dir, "y one");
+    let push =
+        |force: bool| w.tool("github_push", json!({"workspace": dir, "branch": "daniel/y", "force": force}));
+    assert!(!push(false).1);
+    let fork = w.dir.path().join("fork-work");
+    git(
+        w.dir.path(),
+        &["clone", "-q", "-b", "daniel/y", w.hub("o/a").to_str().unwrap(), fork.to_str().unwrap()],
+    );
+    w.commit(&fork, "a reviewer's fixup");
+    git(&fork, &["push", "-q", "origin", "daniel/y"]);
+    w.ok("github_fetch", json!({"workspace": dir, "branch": "daniel/y"}));
+    git(&dir, &["reset", "-q", "--hard", "origin/main"]);
+    w.commit(&dir, "y rewritten");
+    // Not knowing counts as no.
+    let (text, is_error) = push(true);
+    assert!(is_error && text.contains("could not be compared with the pull requests of up/a"), "{text}");
+    let merged = |at: Value| {
+        json!([{"number": 9, "merged_at": at, "base": {"ref": "release", "repo": {"id": 1}},
+                "head": {"ref": "daniel/y", "repo": {"id": 5, "full_name": "o/a"}}}])
+    };
+    w.api.on("GET /repos/up/a/pulls", merged(json!("2026-01-01T00:00:00Z")));
+    let (text, is_error) = push(true);
+    assert!(is_error && text.contains("had gone into release of up/a (pull request #9)"), "{text}");
+    // A PR that was closed without merging changes nothing.
+    w.api.on("GET /repos/up/a/pulls", merged(Value::Null));
+    let (text, is_error) = push(true);
+    assert!(!is_error, "{text}");
 }
 
 #[test]
@@ -139,6 +171,9 @@ fn a_renamed_repo_keeps_its_mirror() {
     // Renamed on GitHub, and a token check stored the new name.
     std::fs::rename(w.hub("o/a"), w.hub("o/renamed")).unwrap();
     w.broker.db.conn().execute("UPDATE github_repo_entries SET full_name = 'o/renamed'", []).unwrap();
+    w.broker.github.renamed(w.alice_repo, "o/a", "o/renamed").unwrap();
+    // A mirror that is for some other repo is not taken over.
+    assert!(w.broker.github.renamed(w.alice_repo, "o/b", "o/renamed").is_err());
     let two = w.commit(&dir, "two");
     let (text, is_error) = w.push(&dir, false);
     assert!(!is_error, "{text}");

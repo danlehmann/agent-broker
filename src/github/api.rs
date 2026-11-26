@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::io::Read;
+use std::rc::Rc;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -37,8 +38,8 @@ pub struct Api<'a> {
     pub entry: &'a RepoEntry,
     /// The repo that is asked: the entry's own, or the one it was forked from.
     repo: &'a str,
-    /// Requests made so far for this tool call.
-    requests: Cell<u32>,
+    /// Requests made so far for this tool call, to whichever repo.
+    requests: Rc<Cell<u32>>,
 }
 
 /// How many requests one tool call may make. A list of lists can otherwise grow into
@@ -48,12 +49,12 @@ const MAX_REQUESTS: u32 = 60;
 impl GitHub {
     /// For the repo that branches are pushed to.
     pub(super) fn api<'a>(&'a self, entry: &'a RepoEntry) -> Api<'a> {
-        Api { gh: self, entry, repo: &entry.full_name, requests: Cell::new(0) }
+        Api { gh: self, entry, repo: &entry.full_name, requests: Rc::default() }
     }
 
     /// For the repo that has the pull requests and their CI runs.
     pub(super) fn pr_api<'a>(&'a self, entry: &'a RepoEntry) -> Api<'a> {
-        Api { gh: self, entry, repo: entry.pr_repo(), requests: Cell::new(0) }
+        Api { gh: self, entry, repo: entry.pr_repo(), requests: Rc::default() }
     }
 }
 
@@ -93,7 +94,7 @@ fn origin(url: &str) -> Option<&str> {
 impl Api<'_> {
     /// The same, for the repo that branches are pushed to.
     pub fn of_pushes(&self) -> Api<'_> {
-        self.gh.api(self.entry)
+        Api { gh: self.gh, entry: self.entry, repo: &self.entry.full_name, requests: self.requests.clone() }
     }
 
     /// How many more requests this call may make.

@@ -53,6 +53,7 @@ const UPSTREAM: &str = "refs/upstream/";
 ///
 /// Returns why not, if not. Whatever cannot be established counts as not.
 fn still_own(
+    gh: &GitHub,
     mirror: &Mirror,
     entry: &RepoEntry,
     branch: &str,
@@ -78,12 +79,12 @@ fn still_own(
     // old name: merged, deleted and created again from where it was merged to. Only branches
     // as they are on GitHub right now can tell, whichever branch it was merged into.
     let mut fetched = true;
-    // Of the repo a fork came from only the default branch, where its work is merged: that
-    // repo is someone else's and may have any number of branches.
-    let base = entry.upstream_default.as_str();
+    // Of the repo a fork came from only the default branch, whatever it is called now: that
+    // repo is someone else's and may have any number of branches. Merges into its other
+    // branches are found below, through its pull requests.
     let sources = [
         (Some("origin".to_string()), format!("+refs/heads/*:{OTHERS}*")),
-        (mirror.upstream(), format!("+refs/heads/{base}:{UPSTREAM}{base}")),
+        (mirror.upstream(), format!("+HEAD:{UPSTREAM}default")),
     ];
     for (from, spec) in sources {
         let Some(from) = from else { continue };
@@ -98,10 +99,40 @@ fn still_own(
         return Ok(Some(format!("could not be compared with the repo's other branches. {advice}")));
     }
     // Not the agents' own branches: one stacked on this one has its commits without any merge.
-    let merged_into = holders.stdout.lines().find_map(|name| {
+    let mut merged_into = holders.stdout.lines().find_map(|name| {
         let own = |name: &&str| *name != branch && !name.starts_with(&entry.branch_prefix);
-        name.strip_prefix(OTHERS).filter(own).or(name.strip_prefix(UPSTREAM))
+        let upstream = || format!("the default branch of {}", entry.upstream);
+        name.strip_prefix(OTHERS)
+            .filter(own)
+            .map(str::to_string)
+            .or(name.starts_with(UPSTREAM).then(upstream))
     });
+    // A fork's work goes into the other repo through pull requests, to any branch there and
+    // also squashed, which no comparison of commits shows.
+    if merged_into.is_none() && entry.is_fork() {
+        let head = format!("{}:{branch}", entry.owner());
+        let closed =
+            gh.pr_api(entry).get("/pulls", &[("head", &head), ("state", "closed"), ("per_page", "100")]);
+        let Ok(closed) = closed else {
+            return Ok(Some(format!(
+                "could not be compared with the pull requests of {}. {advice}",
+                entry.upstream
+            )));
+        };
+        merged_into = closed
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|pr| super::rules::own_pr(pr, entry) && !pr["merged_at"].is_null())
+            .map(|pr| {
+                format!(
+                    "{} of {} (pull request #{})",
+                    pr["base"]["ref"].as_str().unwrap_or("a branch"),
+                    entry.upstream,
+                    pr["number"]
+                )
+            });
+    }
     Ok(merged_into.map(|name| {
         format!(
             "was continued by someone else after what this tool pushed there had gone into {name}, so it may be a new branch under an old name. {advice}"
@@ -230,7 +261,7 @@ impl GitHub {
                         "{branch} was not first pushed through this tool, so its history cannot be rewritten; ask the human"
                     ));
                 };
-                if let Some(why) = still_own(&mirror, entry, branch, last_pushed.as_deref(), old)? {
+                if let Some(why) = still_own(self, &mirror, entry, branch, last_pushed.as_deref(), old)? {
                     return refuse(format!("{branch} on GitHub ({}) {why}", sha12(old)));
                 }
                 // Guards against accidents only: the caller reports what it last saw.
@@ -249,7 +280,8 @@ impl GitHub {
         if !done.ok {
             // GitHub wants a special permission for commits that change workflow files. A
             // branch started from the repo a fork came from can carry such commits of others.
-            let workflows = done.stderr.contains("workflow") && done.stderr.contains("scope");
+            // By GitHub's own words for it, not by words a branch name could have.
+            let workflows = done.stderr.contains("refusing to allow") && done.stderr.contains("workflow");
             let advice = match (workflows, entry.is_fork()) {
                 (true, true) => format!(
                     "\nThe branch has changes to workflow files that {} does not have yet. If they are not yours, ask the human to bring the fork's {} up to date with {} on GitHub (\"Sync fork\"), then push again.",
@@ -284,7 +316,7 @@ impl GitHub {
                     || match db.created_branch(entry.resource_id, branch) {
                         // Recorded before the broker kept what it pushed: start now.
                         Ok(Some(None)) => true,
-                        Ok(Some(last)) => still_own(&mirror, entry, branch, last.as_deref(), old)
+                        Ok(Some(last)) => still_own(self, &mirror, entry, branch, last.as_deref(), old)
                             .is_ok_and(|why| why.is_none()),
                         _ => false,
                     };

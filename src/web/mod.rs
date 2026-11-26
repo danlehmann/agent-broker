@@ -625,6 +625,12 @@ impl Web {
                 ),
             ),
         };
+        // The mirror follows the repo's new name; one that cannot is reported at its next use.
+        if *full_name != row.full_name
+            && let Err(e) = self.broker.github.renamed(id, &row.full_name, full_name)
+        {
+            log(&format!("web: {e}"), None);
+        }
         self.note(ctx, event, true, Some(full_name), &detail);
         Ok(resp)
     }

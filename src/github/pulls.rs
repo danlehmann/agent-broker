@@ -14,11 +14,21 @@ pub fn create(api: &Api, args: &Args) -> Result<String> {
         true => format!("{}:{branch}", api.entry.owner()),
         false => branch.to_string(),
     };
+    let base = match str_arg(args, "base") {
+        Some(base) => base.to_string(),
+        // The other repo's default branch as it is now: the stored name is as old as the
+        // last token check.
+        None if api.entry.is_fork() => {
+            let now = api.get("", &[]).unwrap_or_default();
+            Some(text(&now["default_branch"])).filter(|b| !b.is_empty()).unwrap_or(api.entry.pr_base()).into()
+        }
+        None => api.entry.pr_base().to_string(),
+    };
     let mut pr = json!({
         "title": str_arg(args, "title"),
         "body": str_arg(args, "body").unwrap_or(""),
         "head": head,
-        "base": str_arg(args, "base").unwrap_or(api.entry.pr_base()),
+        "base": base,
         "draft": true,
     });
     // GitHub needs the fork's name when both repos have the same owner, where the owner in
@@ -135,12 +145,51 @@ pub fn list_state(args: &Args) -> Result<&str> {
     }
 }
 
+/// How many of a fork's branches `github_pr_list` asks about.
+const MAX_FORK_BRANCHES: usize = 40;
+
+/// The PRs from a fork's branches with the prefix. The repo they are in is someone else's
+/// and may have thousands, so it is asked about each branch, not for all its PRs.
+fn of_fork(api: &Api, state: &str) -> Result<(Vec<Value>, Option<String>)> {
+    let entry = api.entry;
+    let refs =
+        api.of_pushes().paged(&format!("/git/matching-refs/heads/{}", entry.branch_prefix), &[], None)?;
+    let branches: Vec<&str> =
+        refs.items.iter().filter_map(|r| text(&r["ref"]).strip_prefix("refs/heads/")).collect();
+    let mut found = Vec::new();
+    for branch in branches.iter().take(MAX_FORK_BRANCHES) {
+        let head = format!("{}:{branch}", entry.owner());
+        let prs = api.get("/pulls", &[("head", &head), ("state", state), ("per_page", "100")])?;
+        found.extend(prs.as_array().cloned().unwrap_or_default());
+    }
+    found.sort_by_key(|pr| std::cmp::Reverse(pr["number"].as_i64()));
+    let mut notes = Vec::new();
+    if refs.cut || branches.len() > MAX_FORK_BRANCHES {
+        notes.push(format!(
+            "only {MAX_FORK_BRANCHES} of the {}* branches in {} were asked about; delete merged ones there to see the rest",
+            entry.branch_prefix, entry.full_name
+        ));
+    }
+    if state != "open" {
+        notes.push(format!("PRs whose branch is gone from {} are not listed", entry.full_name));
+    }
+    Ok((found, Some(notes.join("; ")).filter(|n| !n.is_empty()).map(|n| format!("({n})"))))
+}
+
 pub fn list(api: &Api, args: &Args) -> Result<String> {
     let state = list_state(args)?;
     let prefix = &api.entry.branch_prefix;
-    let found = api.paged("/pulls", &[("state", state)], None)?;
-    let mut lines: Vec<String> = found
-        .items
+    let (items, cut, note) = match api.entry.is_fork() {
+        true => {
+            let (items, note) = of_fork(api, state)?;
+            (items, false, note)
+        }
+        false => {
+            let found = api.paged("/pulls", &[("state", state)], None)?;
+            (found.items, found.cut, None)
+        }
+    };
+    let mut lines: Vec<String> = items
         .iter()
         // Another repo may have a branch of the same name.
         .filter(|pr| super::rules::own_pr(pr, api.entry))
@@ -155,7 +204,8 @@ pub fn list(api: &Api, args: &Args) -> Result<String> {
     if lines.is_empty() {
         lines.push(format!("no {kind} from {prefix}* branches"));
     }
-    if found.cut {
+    lines.extend(note);
+    if cut {
         lines.push(format!(
             "(only the {MAX_ITEMS} newest {kind} of the repo were searched; older ones are missing here)"
         ));

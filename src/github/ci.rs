@@ -27,7 +27,23 @@ pub fn status(api: &Api, args: &Args) -> Result<String> {
         },
     };
     let mut out = vec![format!("commit {sha}")];
-    let runs = api.paged("/actions/runs", &[("head_sha", &sha)], Some("workflow_runs"))?;
+    report(api, &sha, &mut out)?;
+    // A fork can have workflows of its own, which run when a branch is pushed there.
+    if api.entry.is_fork() {
+        out.push(format!("in the fork {}:", api.entry.full_name));
+        let fork = api.of_pushes();
+        match report(&fork, &sha, &mut out) {
+            Ok(()) => {}
+            // The commit may not be in the fork at all.
+            Err(e) => out.push(format!("  (not available: {})", e.public())),
+        }
+    }
+    Ok(out.join("\n"))
+}
+
+/// The runs and statuses that one repo has for a commit.
+fn report(api: &Api, sha: &str, out: &mut Vec<String>) -> Result<()> {
+    let runs = api.paged("/actions/runs", &[("head_sha", sha)], Some("workflow_runs"))?;
     let more = |cut: bool, what: &str| cut.then(|| format!("(only the first {MAX_ITEMS} {what} are shown)"));
     out.extend(more(runs.cut, "runs"));
     let runs = runs.items;
@@ -87,7 +103,7 @@ pub fn status(api: &Api, args: &Args) -> Result<String> {
             format!("status {}: {} {}", text(&s["context"]), text(&s["state"]), text(&s["description"]));
         out.push(line.trim_end().to_string());
     }
-    Ok(out.join("\n"))
+    Ok(())
 }
 
 /// The compiled `grep` argument. The engine is linear-time, so agents may supply patterns.
@@ -101,7 +117,12 @@ pub fn pattern(args: &Args) -> Result<Option<Regex>> {
 
 pub fn logs(api: &Api, args: &Args) -> Result<String> {
     let re = pattern(args)?;
-    let log = api.log(&format!("/actions/jobs/{}/logs", int_arg(args, "job_id").unwrap_or(0)))?;
+    let path = format!("/actions/jobs/{}/logs", int_arg(args, "job_id").unwrap_or(0));
+    let log = match api.log(&path) {
+        // The job may be one of the fork's own.
+        Err(_) if api.entry.is_fork() => api.of_pushes().log(&path)?,
+        other => other?,
+    };
     let count = |name, default| int_arg(args, name).unwrap_or(default).max(0) as usize;
     let grep = str_arg(args, "grep").unwrap_or("");
     Ok(select(&log, re.as_ref().map(|re| (re, grep)), count("tail", 200), count("context", 3)))

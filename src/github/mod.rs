@@ -182,6 +182,24 @@ impl GitHub {
         }
     }
 
+    /// Points an entry's mirror at the repo's new name. Only a mirror that was made for the
+    /// old name: one that is for anything else is not this entry's, and stays "broken".
+    pub fn renamed(&self, resource_id: i64, old: &str, new: &str) -> Result<()> {
+        let lock = self.lock(resource_id);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let path = self.mirrors.join(format!("{resource_id}.git"));
+        if !path.exists() {
+            return Ok(());
+        }
+        let entry = RepoEntry { resource_id, full_name: old.into(), ..Default::default() };
+        let mirror = self.mirror(&entry)?;
+        let url = format!("{}{new}.git", self.endpoints.git);
+        match mirror.git(&["config", "remote.origin.url", &url])?.ok {
+            true => Ok(()),
+            false => Err(crate::error::Error::Internal(format!("cannot rename mirror {}", path.display()))),
+        }
+    }
+
     fn is_forgotten(&self, resource_id: i64) -> bool {
         self.forgotten.lock().unwrap_or_else(|e| e.into_inner()).contains(&resource_id)
     }
