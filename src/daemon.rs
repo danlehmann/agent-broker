@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 
 use crate::db::Db;
-use crate::dispatch::{Broker, PENDING_LIFETIME, Pending, Reply, log};
+use crate::dispatch::{Broker, Pending, Reply, log};
 use crate::error::{Error, Result, refuse};
 use crate::github::{Endpoints, GitHub};
 use crate::platform::{self, Kernel};
@@ -180,10 +180,10 @@ fn connection(broker: &Broker, stream: &UnixStream, uid: u32) -> std::io::Result
     let mut session = Session { broker, uid, pending: None };
     let mut reader = BufReader::new(stream);
     while let Some(request) = proto::read_message(&mut reader)? {
+        // Also for the bytes of an upload: once it has started, it has to keep coming.
+        stream.set_read_timeout(Some(IDLE))?;
         session.request(&mut reader, stream, &request)?;
-        // Between the two steps of an upload the caller is busy packing, not idle.
-        let wait = if session.pending.is_some() { PENDING_LIFETIME } else { IDLE };
-        stream.set_read_timeout(Some(wait))?;
+        stream.set_read_timeout(Some(session.wait()))?;
     }
     Ok(())
 }
@@ -203,6 +203,16 @@ impl Drop for Session<'_> {
 }
 
 impl Session<'_> {
+    /// How long to wait for the next request.
+    fn wait(&self) -> Duration {
+        match &self.pending {
+            // Between the two steps of an upload the caller is busy packing, not idle. It
+            // gets the time that is left for the upload, never more than that.
+            Some(pending) => pending.remaining().max(Duration::from_secs(1)),
+            None => IDLE,
+        }
+    }
+
     fn request(
         &mut self,
         reader: &mut BufReader<&UnixStream>,

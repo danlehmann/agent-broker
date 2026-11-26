@@ -17,7 +17,7 @@ use crate::spec::{self, Args, Flow, Tool, str_arg};
 const UNLINKED: &str =
     "this unix account is not linked to a user; ask the human to link it in the agent-broker web UI";
 /// How long an upload may take to start after its first step.
-pub const PENDING_LIFETIME: Duration = Duration::from_secs(600);
+const PENDING_LIFETIME: Duration = Duration::from_secs(600);
 const REFUSALS_PER_MINUTE: u32 = 60;
 const CLAIMS_PER_MINUTE: u32 = 5;
 
@@ -86,6 +86,11 @@ impl Pending {
     /// Whether the second step comes too late.
     pub fn expired(&self) -> bool {
         self.started.elapsed() > PENDING_LIFETIME
+    }
+
+    /// How long the second step may still take to start.
+    pub fn remaining(&self) -> Duration {
+        PENDING_LIFETIME.saturating_sub(self.started.elapsed())
     }
 }
 

@@ -92,9 +92,14 @@ pub fn comment(api: &Api, args: &Args) -> Result<String> {
         Place::Conversation => {
             api.send("POST", &format!("/issues/{number}/comments"), &json!({"body": body}))?
         }
-        // GitHub only accepts the id of a review comment on this same PR.
         Place::Reply(id) => {
-            api.send("POST", &format!("/pulls/{number}/comments/{id}/replies"), &json!({"body": body}))?
+            let target = api.get(&format!("/pulls/comments/{id}"), &[])?;
+            if !text(&target["pull_request_url"]).ends_with(&format!("/pulls/{number}")) {
+                return refuse(format!("review comment {id} is not on PR #{number}"));
+            }
+            // GitHub takes replies only to the comment that started a thread.
+            let first = target["in_reply_to_id"].as_i64().unwrap_or(id);
+            api.send("POST", &format!("/pulls/{number}/comments/{first}/replies"), &json!({"body": body}))?
         }
         Place::Line(path, line) => api.send(
             "POST",
@@ -127,12 +132,14 @@ pub fn list(api: &Api, args: &Args) -> Result<String> {
             format!("#{} [{shown}] {}: {}", pr["number"], text(&pr["head"]["ref"]), text(&pr["title"]))
         })
         .collect();
+    // "open PRs", "closed PRs", or just "PRs" for all of them.
+    let kind = if state == "all" { "PRs".to_string() } else { format!("{state} PRs") };
     if lines.is_empty() {
-        lines.push(format!("no {state} PRs from {prefix}* branches"));
+        lines.push(format!("no {kind} from {prefix}* branches"));
     }
     if found.cut {
         lines.push(format!(
-            "(only the {MAX_ITEMS} newest {state} PRs of the repo were searched; older ones are missing here)"
+            "(only the {MAX_ITEMS} newest {kind} of the repo were searched; older ones are missing here)"
         ));
     }
     Ok(lines.join("\n"))

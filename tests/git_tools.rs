@@ -103,6 +103,43 @@ fn force_is_lost_when_someone_else_makes_the_branch_anew() {
 }
 
 #[test]
+fn force_needs_what_it_checks_to_be_known() {
+    // Others added commits, and the default branch cannot be fetched: whether the branch was
+    // merged and made anew is unknown, so the answer is no. The mirror still has an old main.
+    let w = World::new();
+    let dir = w.clone("work");
+    w.commit(&dir, "one");
+    assert!(!w.push(&dir, false).1);
+    let human = human_clone(&w, "human", "daniel/x");
+    // The default branch is renamed on GitHub, after the agent's work went into it.
+    git(&human, &["push", "-q", "origin", "daniel/x:main"]);
+    git(&w.hub("o/a"), &["branch", "-m", "main", "trunk"]);
+    let theirs = w.commit(&human, "more");
+    git(&human, &["push", "-q", "origin", "daniel/x"]);
+    w.ok("github_fetch", json!({"workspace": dir, "branch": "daniel/x"}));
+    git(&dir, &["commit", "-q", "--amend", "-m", "rewrite"]);
+    let (text, is_error) = w.push(&dir, true);
+    assert!(is_error && text.contains("default branch could not be fetched"), "{text}");
+    assert_eq!(w.hub_ref("o/a", "daniel/x"), Some(theirs.clone()));
+    // Untouched by others, the branch needs no such check.
+    git(&dir, &["reset", "-q", "--hard", "origin/daniel/x"]);
+    w.commit(&dir, "on top");
+    assert!(!w.push(&dir, false).1);
+    git(&dir, &["commit", "-q", "--amend", "-m", "on top, reworded"]);
+    assert!(!w.push(&dir, true).1);
+
+    // A branch recorded before the broker kept what it pushed.
+    let conn = w.broker.db.conn();
+    conn.execute("UPDATE github_created_branches SET tip = NULL", []).unwrap();
+    drop(conn);
+    let before = w.hub_ref("o/a", "daniel/x");
+    git(&dir, &["commit", "-q", "--amend", "-m", "reworded again"]);
+    let (text, is_error) = w.push(&dir, true);
+    assert!(is_error && text.contains("has no record of what it last pushed"), "{text}");
+    assert_eq!(w.hub_ref("o/a", "daniel/x"), before);
+}
+
+#[test]
 fn force_needs_a_broker_created_branch() {
     let w = World::new();
     let dir = w.clone("work");

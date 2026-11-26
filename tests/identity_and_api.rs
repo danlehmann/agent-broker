@@ -169,6 +169,23 @@ fn pull_requests() {
     }
     w.api.seen.lock().unwrap().clear();
     w.api.on("POST /repos/o/a/pulls/1/comments/5/replies", json!({"html_url": "http://x/r"}));
+    let on_pr = |n: i64| format!("http://api/repos/o/a/pulls/{n}");
+    w.api.on("GET /repos/o/a/pulls/comments/5", json!({"id": 5, "pull_request_url": on_pr(1)}));
+    w.api.on(
+        "GET /repos/o/a/pulls/comments/6",
+        json!({"id": 6, "in_reply_to_id": 5, "pull_request_url": on_pr(1)}),
+    );
+    w.api.on("GET /repos/o/a/pulls/comments/9", json!({"id": 9, "pull_request_url": on_pr(11)}));
+    // A comment of another PR, and one that does not exist.
+    let text = w.err("github_pr_comment", json!({"number": 1, "body": "re", "reply_to": 9}));
+    assert_eq!(text, "review comment 9 is not on PR #1");
+    assert!(w.err("github_pr_comment", json!({"number": 1, "body": "re", "reply_to": 8})).contains("404"));
+    assert!(w.api.writes().is_empty());
+    // GitHub takes no reply to a reply, so it goes to the comment that started the thread.
+    let text = w.ok("github_pr_comment", json!({"number": 1, "body": "re", "reply_to": 6}));
+    assert_eq!(text, "commented: http://x/r");
+    assert_eq!(w.api.writes(), ["POST /repos/o/a/pulls/1/comments/5/replies"]);
+    w.api.seen.lock().unwrap().clear();
     w.api.on("POST /repos/o/a/pulls/1/comments", json!({"html_url": "http://x/l"}));
     let text = w.ok("github_pr_comment", json!({"number": 1, "body": "re", "reply_to": 5}));
     assert_eq!(text, "commented: http://x/r");
@@ -199,7 +216,7 @@ fn pull_requests() {
     w.api.on("GET /repos/o/a/pulls", json!([pr(1, "daniel/x", own.clone()), pr(2, "someone/x", own)]));
     assert_eq!(w.ok("github_pr_list", json!({})), "#1 [draft] daniel/x: T");
     w.api.on("GET /repos/o/a/pulls", json!([]));
-    assert_eq!(w.ok("github_pr_list", json!({"state": "all"})), "no all PRs from daniel/* branches");
+    assert_eq!(w.ok("github_pr_list", json!({"state": "all"})), "no PRs from daniel/* branches");
     assert_eq!(w.err("github_pr_view", json!({"branch": "daniel/none"})), "no PR for branch daniel/none");
     assert_eq!(w.err("github_pr_view", json!({})), "give number or branch");
 
@@ -235,7 +252,12 @@ fn pagination() {
     for n in 1..=6 {
         w.api.on(&path(n), page(n, 100));
     }
+    // Exactly as many as are read: nothing is missing.
+    let after = "GET /repos/o/a/pulls?state=open&per_page=1&page=501";
+    w.api.on(after, json!([]));
+    assert_eq!(w.ok("github_pr_list", json!({})).lines().count(), 500);
     // Stopping early is said, also when nothing of what was read matched.
+    w.api.on(after, json!([pr(1, "daniel/x", Value::Null)]));
     let text = w.ok("github_pr_list", json!({}));
     assert_eq!(text.lines().count(), 501);
     let note = "(only the 500 newest open PRs of the repo were searched; older ones are missing here)";
@@ -254,6 +276,7 @@ fn pagination() {
         let path = format!("GET /repos/o/a/pulls/1/comments?per_page=100&page={n}");
         w.api.on(&path, Value::Array(vec![comment.clone(); 100]));
     }
+    w.api.on("GET /repos/o/a/pulls/1/comments?per_page=1&page=501", json!([comment]));
     assert!(
         w.ok("github_pr_view", json!({"number": 1}))
             .ends_with("\n(only the first 500 are shown; there are more)")

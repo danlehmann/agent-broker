@@ -88,7 +88,7 @@ impl Api<'_> {
     /// in an object.
     pub fn paged(&self, path: &str, query: &[(&str, &str)], key: Option<&str>) -> Result<Paged> {
         let mut items = Vec::new();
-        let mut cut = false;
+        let mut all_full = true;
         for page in 1..=MAX_PAGES {
             let (per_page, page) = (PAGE.to_string(), page.to_string());
             let mut query = query.to_vec();
@@ -98,14 +98,29 @@ impl Api<'_> {
                 Some(key) => reply[key].take(),
                 None => reply,
             };
-            let Value::Array(list) = list else { break };
+            let list = match list {
+                Value::Array(list) => list,
+                _ => vec![],
+            };
             let full = list.len() >= PAGE;
             items.extend(list);
-            cut = full;
             if !full {
+                all_full = false;
                 break;
             }
         }
+        // Exactly as many as are read is not "more": ask for the one after the last.
+        let cut = all_full && {
+            let after = (MAX_ITEMS + 1).to_string();
+            let mut query = query.to_vec();
+            query.extend([("per_page", "1"), ("page", &*after)]);
+            let mut reply = self.get(path, &query)?;
+            let next = match key {
+                Some(key) => reply[key].take(),
+                None => reply,
+            };
+            next.as_array().is_some_and(|list| !list.is_empty())
+        };
         Ok(Paged { items, cut })
     }
 

@@ -63,7 +63,9 @@ impl Client {
             }
         };
         let Ok(line) = proto::encode(&request) else {
-            return refuse("the request is larger than agent-broker accepts (1 MiB); shorten the text");
+            return refuse(
+                "the request is larger than agent-broker accepts (1 MiB); make its arguments shorter",
+            );
         };
         let sent = (|| {
             let mut stream = self.reader.get_ref();
