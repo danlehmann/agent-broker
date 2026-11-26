@@ -45,20 +45,35 @@ pub fn check_repo_name(name: &str) -> Result<()> {
     }
 }
 
-/// Whether a PR comes from a branch with the entry's prefix in this very repo. The head repo
-/// is absent when a fork was deleted.
-/// Whether the PR's branch is in the repo itself, not in a fork. By id: after a rename
-/// GitHub answers under the new name, which the stored one would not match.
-pub fn same_repo(pr: &Value) -> bool {
-    let id = pr["head"]["repo"]["id"].as_i64();
-    id.is_some() && id == pr["base"]["repo"]["id"].as_i64()
+/// Whether the PR's branch is in the repo the PR is for, not in a fork of it. By id: after
+/// a rename GitHub answers under the new name, which the stored one would not match. The
+/// head repo is absent when a fork was deleted.
+fn same_repo(pr: &Value) -> Option<bool> {
+    let id = pr["head"]["repo"]["id"].as_i64()?;
+    Some(id == pr["base"]["repo"]["id"].as_i64()?)
+}
+
+/// Whether a PR comes from a branch with the entry's prefix in the repo the entry pushes to.
+///
+/// For a fork that repo is told by its name. Its owner is the human's own account, so nobody
+/// else can have a repo of that name; GitHub compares names without regard to case.
+pub fn own_pr(pr: &Value, entry: &RepoEntry) -> bool {
+    let from_entry = match entry.is_fork() {
+        false => same_repo(pr) == Some(true),
+        true => {
+            same_repo(pr) == Some(false)
+                && pr["head"]["repo"]["full_name"]
+                    .as_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&entry.full_name))
+        }
+    };
+    from_entry
+        && !entry.branch_prefix.is_empty()
+        && pr["head"]["ref"].as_str().is_some_and(|r| r.starts_with(&entry.branch_prefix))
 }
 
 pub fn check_own_pr(pr: &Value, number: i64, entry: &RepoEntry) -> Result<()> {
-    let same_repo = same_repo(pr);
-    let own_branch = !entry.branch_prefix.is_empty()
-        && pr["head"]["ref"].as_str().is_some_and(|r| r.starts_with(&entry.branch_prefix));
-    if same_repo && own_branch {
+    if own_pr(pr, entry) {
         return Ok(());
     }
     let (prefix, repo) = (&entry.branch_prefix, &entry.full_name);
@@ -80,8 +95,8 @@ pub(crate) fn test_entry() -> RepoEntry {
         full_name: "o/r".into(),
         branch_prefix: "daniel/".into(),
         default_branch: "main".into(),
-        enabled_tools: vec![],
         token: "t".into(),
+        ..Default::default()
     }
 }
 
@@ -151,7 +166,31 @@ mod tests {
     }
 
     #[test]
-    fn own_pr() {
+    fn own_pr_of_a_fork() {
+        let e = RepoEntry { full_name: "me/r".into(), upstream: "o/r".into(), ..test_entry() };
+        let pr = |repo: Value, r: &str| json!({"head": {"repo": repo, "ref": r}, "base": {"repo": {"id": 1, "full_name": "o/r"}}});
+        assert!(own_pr(&pr(json!({"id": 5, "full_name": "me/r"}), "daniel/x"), &e));
+        assert!(own_pr(&pr(json!({"id": 5, "full_name": "Me/R"}), "daniel/x"), &e));
+        for bad in [
+            // Someone else's fork, with a branch of the same name.
+            pr(json!({"id": 6, "full_name": "evil/r"}), "daniel/x"),
+            // A branch of that name in the repo the PRs go to.
+            pr(json!({"id": 1, "full_name": "o/r"}), "daniel/x"),
+            pr(json!({"id": 1, "full_name": "me/r"}), "daniel/x"),
+            pr(json!({"id": 5, "full_name": "me/r"}), "main"),
+            pr(json!({"id": 5, "full_name": "me/r2"}), "daniel/x"),
+            pr(json!({"full_name": "me/r"}), "daniel/x"),
+            pr(Value::Null, "daniel/x"),
+        ] {
+            assert!(!own_pr(&bad, &e), "{bad}");
+        }
+        // And an entry that is no fork does not take a fork's PR for its own.
+        let plain = RepoEntry { full_name: "me/r".into(), ..test_entry() };
+        assert!(!own_pr(&pr(json!({"id": 5, "full_name": "me/r"}), "daniel/x"), &plain));
+    }
+
+    #[test]
+    fn own_pr_of_the_repo_itself() {
         let e = test_entry();
         let pr = |repo: Value, r: &str| json!({"head": {"repo": repo, "ref": r}, "base": {"repo": {"id": 1, "full_name": "o/r"}}});
         let check = |pr: &Value| check_own_pr(pr, 7, &e).map_err(|x| x.public().to_string());

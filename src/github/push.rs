@@ -45,12 +45,15 @@ fn commit_arg(local: &Map<String, Value>, name: &str) -> Result<Option<String>> 
 
 /// Where all branches of the repo are fetched to when a forced push has to look at them.
 const OTHERS: &str = "refs/others/";
+/// The same for the repo a fork was forked from, where its work is merged.
+const UPSTREAM: &str = "refs/upstream/";
 
 /// Whether the branch now at `old` is still the one the broker last pushed `last` to. The
 /// name alone does not say so: the branch may have been deleted and created again.
 ///
 /// Returns why not, if not. Whatever cannot be established counts as not.
 fn still_own(
+    gh: &GitHub,
     mirror: &Mirror,
     entry: &RepoEntry,
     branch: &str,
@@ -75,21 +78,61 @@ fn still_own(
     // If what the broker pushed went into another branch, this one may be new work under an
     // old name: merged, deleted and created again from where it was merged to. Only branches
     // as they are on GitHub right now can tell, whichever branch it was merged into.
-    let spec = format!("+refs/heads/*:{OTHERS}*");
-    let fetch = ["fetch", "--prune", "--no-tags", "--quiet", "--no-write-fetch-head", "origin", &spec];
-    let holders = match mirror.git_auth(&fetch)?.ok {
-        true => mirror.git(&["for-each-ref", "--format=%(refname)", "--contains", last, OTHERS])?,
+    let mut fetched = true;
+    // Of the repo a fork came from only the default branch, whatever it is called now: that
+    // repo is someone else's and may have any number of branches. Merges into its other
+    // branches are found below, through its pull requests.
+    let sources = [
+        (Some("origin".to_string()), format!("+refs/heads/*:{OTHERS}*")),
+        (mirror.upstream(), format!("+HEAD:{UPSTREAM}default")),
+    ];
+    for (from, spec) in sources {
+        let Some(from) = from else { continue };
+        let fetch = ["fetch", "--prune", "--no-tags", "--quiet", "--no-write-fetch-head", &from, &spec];
+        fetched &= mirror.git_auth(&fetch)?.ok;
+    }
+    let holders = match fetched {
+        true => mirror.git(&["for-each-ref", "--format=%(refname)", "--contains", last, OTHERS, UPSTREAM])?,
         false => return Ok(Some(format!("could not be compared with the repo's other branches. {advice}"))),
     };
     if !holders.ok {
         return Ok(Some(format!("could not be compared with the repo's other branches. {advice}")));
     }
     // Not the agents' own branches: one stacked on this one has its commits without any merge.
-    let merged_into = holders
-        .stdout
-        .lines()
-        .filter_map(|name| name.strip_prefix(OTHERS))
-        .find(|name| *name != branch && !name.starts_with(&entry.branch_prefix));
+    let mut merged_into = holders.stdout.lines().find_map(|name| {
+        let own = |name: &&str| *name != branch && !name.starts_with(&entry.branch_prefix);
+        let upstream = || format!("the default branch of {}", entry.upstream);
+        name.strip_prefix(OTHERS)
+            .filter(own)
+            .map(str::to_string)
+            .or(name.starts_with(UPSTREAM).then(upstream))
+    });
+    // A fork's work goes into the other repo through pull requests, to any branch there and
+    // also squashed, which no comparison of commits shows.
+    if merged_into.is_none() && entry.is_fork() {
+        let head = format!("{}:{branch}", entry.owner());
+        let closed =
+            gh.pr_api(entry).get("/pulls", &[("head", &head), ("state", "closed"), ("per_page", "100")]);
+        let Ok(closed) = closed else {
+            return Ok(Some(format!(
+                "could not be compared with the pull requests of {}. {advice}",
+                entry.upstream
+            )));
+        };
+        merged_into = closed
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|pr| super::rules::own_pr(pr, entry) && !pr["merged_at"].is_null())
+            .map(|pr| {
+                format!(
+                    "{} of {} (pull request #{})",
+                    pr["base"]["ref"].as_str().unwrap_or("a branch"),
+                    entry.upstream,
+                    pr["number"]
+                )
+            });
+    }
     Ok(merged_into.map(|name| {
         format!(
             "was continued by someone else after what this tool pushed there had gone into {name}, so it may be a new branch under an old name. {advice}"
@@ -143,9 +186,10 @@ impl GitHub {
             basis.push(old.clone());
         }
         // Only makes the bundle smaller, so a missing default branch is fine.
-        let default = fetched_ref(&entry.default_branch);
-        let spec = format!("+refs/heads/{}:{default}", entry.default_branch);
-        if mirror.git_auth(&["fetch", "--no-tags", "--quiet", "--no-write-fetch-head", "origin", &spec])?.ok
+        let base = entry.pr_base();
+        let (default, from) = (fetched_ref(base), mirror.source(base));
+        let spec = format!("+refs/heads/{base}:{default}");
+        if mirror.git_auth(&["fetch", "--no-tags", "--quiet", "--no-write-fetch-head", &from, &spec])?.ok
             && let Some(commit) = mirror.resolve(&default)?
             && !basis.contains(&commit)
         {
@@ -217,7 +261,7 @@ impl GitHub {
                         "{branch} was not first pushed through this tool, so its history cannot be rewritten; ask the human"
                     ));
                 };
-                if let Some(why) = still_own(&mirror, entry, branch, last_pushed.as_deref(), old)? {
+                if let Some(why) = still_own(self, &mirror, entry, branch, last_pushed.as_deref(), old)? {
                     return refuse(format!("{branch} on GitHub ({}) {why}", sha12(old)));
                 }
                 // Guards against accidents only: the caller reports what it last saw.
@@ -232,7 +276,25 @@ impl GitHub {
         }
         args.extend(["origin".to_string(), target]);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        mirror.git_auth_or("push failed", &args)?;
+        let done = mirror.git_auth(&args)?;
+        if !done.ok {
+            // GitHub wants a special permission for commits that change workflow files. A
+            // branch started from the repo a fork came from can carry such commits of others.
+            // By GitHub's own words for it, not by words a branch name could have.
+            let workflows = done.stderr.contains("refusing to allow") && done.stderr.contains("workflow");
+            let advice = match (workflows, entry.is_fork()) {
+                (true, true) => format!(
+                    "\nThe branch has changes to workflow files that {} does not have yet. If they are not yours, ask the human to bring the fork's {} up to date with {} on GitHub (\"Sync fork\"), then push again.",
+                    entry.full_name, entry.default_branch, entry.upstream
+                ),
+                (true, false) => {
+                    "\nThe token may not change workflow files; leave them as they are, or ask the human."
+                        .into()
+                }
+                (false, _) => String::new(),
+            };
+            return refuse(format!("push failed:\n{}{advice}", done.stderr));
+        }
 
         // The push happened; nothing below may turn it into a failure.
         let _ = mirror.git(&["update-ref", &fetched_ref(branch), &new]);
@@ -254,7 +316,7 @@ impl GitHub {
                     || match db.created_branch(entry.resource_id, branch) {
                         // Recorded before the broker kept what it pushed: start now.
                         Ok(Some(None)) => true,
-                        Ok(Some(last)) => still_own(&mirror, entry, branch, last.as_deref(), old)
+                        Ok(Some(last)) => still_own(self, &mirror, entry, branch, last.as_deref(), old)
                             .is_ok_and(|why| why.is_none()),
                         _ => false,
                     };

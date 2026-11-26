@@ -220,13 +220,18 @@ fn rules_are_held_against_what_is_stored_at_that_moment() {
     let id = s.repo_id("alice", "o/a");
     // A check that finds the default branch under the prefix switches the entry off, and a
     // form filled in before that cannot switch it on again.
+    let found = |default_branch: &str| agent_broker::github::Found {
+        full_name: "o/a".into(),
+        default_branch: default_branch.into(),
+        parent: None,
+    };
     assert!(matches!(
-        db.set_repo_checked(alice, id, None, "o/a", "daniel/main").unwrap(),
-        Checked::Covered(prefix) if prefix == "daniel/"
+        db.set_repo_checked(alice, id, None, &found("daniel/main")).unwrap(),
+        Checked::Covered(prefix, branch) if prefix == "daniel/" && branch == "daniel/main"
     ));
     assert!(db.update_repo(alice, id, "daniel/", &[], true).is_err());
     assert!(!db.repo_row(alice, id).unwrap().enabled);
-    assert!(matches!(db.set_repo_checked(alice, id, None, "o/a", "main").unwrap(), Checked::Off));
+    assert!(matches!(db.set_repo_checked(alice, id, None, &found("main")).unwrap(), Checked::Off));
 
     // Two admins cannot take each other away: the second change finds no admin left and
     // is undone as a whole.
@@ -507,6 +512,103 @@ fn repos_are_set_up_in_the_browser_and_tokens_never_come_back() {
     let left: i64 =
         s.w.broker.db.conn().query_row("SELECT count(*) FROM credentials", [], |r| r.get(0)).unwrap();
     assert_eq!(left, 2, "alice's first repo and bob's");
+}
+
+#[test]
+fn a_fork_sends_its_pull_requests_to_the_repo_it_was_forked_from() {
+    let s = Site::new();
+    let alice = s.user("alice");
+    let form = |repo: &'static str, prefix: &'static str| {
+        vec![
+            ("repo", repo),
+            ("token", "ghp_CLASSIC789"),
+            ("prefix", prefix),
+            ("tool", "github_push"),
+            ("to_upstream", "1"),
+        ]
+    };
+    // Which repo that is, only GitHub says. Without its word nothing is stored.
+    s.w.api.on("GET /repos/alice/plain", json!({"full_name": "alice/plain", "default_branch": "main"}));
+    assert!(
+        s.done(&alice, "repos/add", &form("alice/plain", "al/"))
+            .contains("does not say that alice/plain is a fork")
+    );
+    assert!(
+        s.done(&alice, "repos/add", &form("alice/unread", "al/"))
+            .contains("is not known. Nothing was stored.")
+    );
+    let fork = |parent: serde_json::Value| json!({"full_name": "alice/proofs", "default_branch": "main", "fork": true, "parent": parent});
+    s.w.api.on(
+        "GET /repos/alice/proofs",
+        fork(json!({"id": 40, "full_name": "goat/proofs", "default_branch": "trunk"})),
+    );
+    // The prefix must spare the default branch of both.
+    assert!(
+        s.done(&alice, "repos/add", &form("alice/proofs", "tr"))
+            .contains("would cover the default branch trunk")
+    );
+    let page = s.done(&alice, "repos/add", &form("alice/proofs", "al/"));
+    assert!(
+        page.contains("Added alice/proofs.") && page.contains("Pull requests go to goat/proofs."),
+        "{page}"
+    );
+    assert!(page.contains(
+        "A fork: pull requests go to <code>goat/proofs</code>, default branch <code>trunk</code>."
+    ));
+    let listed = s.w.ok("github_repos", json!({}));
+    assert!(listed.contains("alice/proofs: branch prefix al/, default branch main, a fork: pull requests go to goat/proofs (default branch trunk)"), "{listed}");
+    let id = s.repo_id("alice", "alice/proofs");
+    assert!(
+        s.done(&alice, &format!("repos/{id}/edit"), &[("prefix", "tru"), ("enabled", "1")])
+            .contains("would cover the default branch trunk")
+    );
+    // A check follows the other repo's rename and its default branch.
+    s.w.api.on(
+        "GET /repos/alice/proofs",
+        fork(json!({"id": 40, "full_name": "goat/theorems", "default_branch": "al/next"})),
+    );
+    let page = s.done(&alice, &format!("repos/{id}/check"), &[]);
+    assert!(page.contains("would cover the default branch al/next. The entry is switched off"), "{page}");
+    assert!(page.contains("<code>goat/theorems</code>"));
+    // A name that could not go into a URL is not taken from GitHub's answer either.
+    s.w.api.on(
+        "GET /repos/alice/proofs",
+        fork(json!({"id": 40, "full_name": "goat/../x", "default_branch": "trunk"})),
+    );
+    let page = s.done(&alice, &format!("repos/{id}/check"), &[]);
+    assert!(page.contains("no longer says that alice/proofs is a fork"), "{page}");
+    assert!(!s.w.ok("github_repos", json!({})).contains("alice/proofs"));
+    // Switched off like that, it cannot be switched on by hand: not until a check finds the
+    // same repo again.
+    let on = [("prefix", "al/"), ("enabled", "1")];
+    assert!(s.done(&alice, &format!("repos/{id}/edit"), &on).contains("This entry stays off"));
+    s.w.api.on(
+        "GET /repos/alice/proofs",
+        fork(json!({"id": 40, "full_name": "goat/theorems", "default_branch": "trunk"})),
+    );
+    s.done(&alice, &format!("repos/{id}/check"), &[]);
+    assert!(s.done(&alice, &format!("repos/{id}/edit"), &on).contains("Saved the rules"));
+    assert!(s.w.ok("github_repos", json!({})).contains("pull requests go to goat/theorems"));
+    // Another repo that GitHub gives as the origin later is not the one this was added with.
+    s.w.api.on(
+        "GET /repos/alice/proofs",
+        fork(json!({"id": 41, "full_name": "stranger/proofs", "default_branch": "trunk"})),
+    );
+    let page = s.done(&alice, &format!("repos/{id}/check"), &[]);
+    assert!(page.contains("GitHub now gives another repo, stranger/proofs"), "{page}");
+    assert!(page.contains("<code>goat/theorems</code>"), "{page}");
+    assert!(!s.w.ok("github_repos", json!({})).contains("proofs"));
+    assert!(s.done(&alice, &format!("repos/{id}/edit"), &on).contains("This entry stays off"));
+    // An entry that was not added as a fork stays what it is, whatever GitHub says later.
+    let own = s.repo_id("alice", "o/a");
+    s.w.api.on(
+        "GET /repos/o/a",
+        json!({"full_name": "o/a", "default_branch": "main", "fork": true,
+        "parent": {"id": 50, "full_name": "goat/a", "default_branch": "main"}}),
+    );
+    s.done(&alice, &format!("repos/{own}/check"), &[]);
+    let listed = s.w.ok("github_repos", json!({}));
+    assert!(listed.contains("o/a") && !listed.contains("goat/a"), "{listed}");
 }
 
 #[test]

@@ -8,17 +8,35 @@ use crate::error::{Result, refuse};
 use crate::spec::{Args, int_arg, str_arg};
 
 pub fn create(api: &Api, args: &Args) -> Result<String> {
-    let pr = api.send(
-        "POST",
-        "/pulls",
-        &json!({
-            "title": str_arg(args, "title"),
-            "body": str_arg(args, "body").unwrap_or(""),
-            "head": str_arg(args, "branch"),
-            "base": str_arg(args, "base").unwrap_or(&api.entry.default_branch),
-            "draft": true,
-        }),
-    )?;
+    let branch = str_arg(args, "branch").unwrap_or_default();
+    // From a fork, the branch is named with the fork's owner.
+    let head = match api.entry.is_fork() {
+        true => format!("{}:{branch}", api.entry.owner()),
+        false => branch.to_string(),
+    };
+    let base = match str_arg(args, "base") {
+        Some(base) => base.to_string(),
+        // The other repo's default branch as it is now: the stored name is as old as the
+        // last token check.
+        None if api.entry.is_fork() => {
+            let now = api.get("", &[]).unwrap_or_default();
+            Some(text(&now["default_branch"])).filter(|b| !b.is_empty()).unwrap_or(api.entry.pr_base()).into()
+        }
+        None => api.entry.pr_base().to_string(),
+    };
+    let mut pr = json!({
+        "title": str_arg(args, "title"),
+        "body": str_arg(args, "body").unwrap_or(""),
+        "head": head,
+        "base": base,
+        "draft": true,
+    });
+    // GitHub needs the fork's name when both repos have the same owner, where the owner in
+    // `head` does not tell them apart.
+    if api.entry.is_fork() {
+        pr["head_repo"] = json!(api.entry.full_name.rsplit('/').next().unwrap_or_default());
+    }
+    let pr = api.send("POST", "/pulls", &pr)?;
     Ok(format!("opened draft PR #{}: {}", pr["number"], text(&pr["html_url"])))
 }
 
@@ -127,16 +145,54 @@ pub fn list_state(args: &Args) -> Result<&str> {
     }
 }
 
+/// How many of a fork's branches `github_pr_list` asks about.
+const MAX_FORK_BRANCHES: usize = 40;
+
+/// The PRs from a fork's branches with the prefix. The repo they are in is someone else's
+/// and may have thousands, so it is asked about each branch, not for all its PRs.
+fn of_fork(api: &Api, state: &str) -> Result<(Vec<Value>, Option<String>)> {
+    let entry = api.entry;
+    let refs =
+        api.of_pushes().paged(&format!("/git/matching-refs/heads/{}", entry.branch_prefix), &[], None)?;
+    let branches: Vec<&str> =
+        refs.items.iter().filter_map(|r| text(&r["ref"]).strip_prefix("refs/heads/")).collect();
+    let mut found = Vec::new();
+    for branch in branches.iter().take(MAX_FORK_BRANCHES) {
+        let head = format!("{}:{branch}", entry.owner());
+        let prs = api.get("/pulls", &[("head", &head), ("state", state), ("per_page", "100")])?;
+        found.extend(prs.as_array().cloned().unwrap_or_default());
+    }
+    found.sort_by_key(|pr| std::cmp::Reverse(pr["number"].as_i64()));
+    let mut notes = Vec::new();
+    if refs.cut || branches.len() > MAX_FORK_BRANCHES {
+        notes.push(format!(
+            "only {MAX_FORK_BRANCHES} of the {}* branches in {} were asked about; delete merged ones there to see the rest",
+            entry.branch_prefix, entry.full_name
+        ));
+    }
+    if state != "open" {
+        notes.push(format!("PRs whose branch is gone from {} are not listed", entry.full_name));
+    }
+    Ok((found, Some(notes.join("; ")).filter(|n| !n.is_empty()).map(|n| format!("({n})"))))
+}
+
 pub fn list(api: &Api, args: &Args) -> Result<String> {
     let state = list_state(args)?;
     let prefix = &api.entry.branch_prefix;
-    let found = api.paged("/pulls", &[("state", state)], None)?;
-    let mut lines: Vec<String> = found
-        .items
+    let (items, cut, note) = match api.entry.is_fork() {
+        true => {
+            let (items, note) = of_fork(api, state)?;
+            (items, false, note)
+        }
+        false => {
+            let found = api.paged("/pulls", &[("state", state)], None)?;
+            (found.items, found.cut, None)
+        }
+    };
+    let mut lines: Vec<String> = items
         .iter()
-        // A fork may have a branch of the same name.
-        .filter(|pr| super::rules::same_repo(pr))
-        .filter(|pr| text(&pr["head"]["ref"]).starts_with(prefix.as_str()))
+        // Another repo may have a branch of the same name.
+        .filter(|pr| super::rules::own_pr(pr, api.entry))
         .map(|pr| {
             let draft = pr["draft"].as_bool() == Some(true);
             let shown = if draft { "draft" } else { text(&pr["state"]) };
@@ -148,7 +204,8 @@ pub fn list(api: &Api, args: &Args) -> Result<String> {
     if lines.is_empty() {
         lines.push(format!("no {kind} from {prefix}* branches"));
     }
-    if found.cut {
+    lines.extend(note);
+    if cut {
         lines.push(format!(
             "(only the {MAX_ITEMS} newest {kind} of the repo were searched; older ones are missing here)"
         ));
@@ -160,9 +217,19 @@ pub fn view(api: &Api, args: &Args) -> Result<String> {
     let number = match (int_arg(args, "number"), str_arg(args, "branch")) {
         (Some(number), _) => number,
         (None, Some(branch)) => {
-            let head = format!("{}:{branch}", api.entry.owner());
+            // A fork has the branches with the prefix; all others are the other repo's own.
+            let entry = api.entry;
+            let in_fork = entry.is_fork() && branch.starts_with(&entry.branch_prefix);
+            let repo = if in_fork { &entry.full_name } else { entry.pr_repo() };
+            let head = format!("{}:{branch}", repo.split('/').next().unwrap_or_default());
             let found = api.get("/pulls", &[("head", &head), ("state", "all")])?;
-            match found[0]["number"].as_i64() {
+            // The owner alone does not tell a fork from the repo it came from if both have
+            // the same one.
+            let from_there = |pr: &&Value| {
+                text(&pr["head"]["repo"]["full_name"]).eq_ignore_ascii_case(repo) || !entry.is_fork()
+            };
+            match found.as_array().into_iter().flatten().find(from_there).and_then(|pr| pr["number"].as_i64())
+            {
                 Some(number) => number,
                 None => return refuse(format!("no PR for branch {branch}")),
             }

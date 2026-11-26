@@ -79,6 +79,107 @@ fn a_deleted_entry_does_not_get_its_mirror_back() {
     assert!(!w.mirror().exists());
 }
 
+#[test]
+fn a_fork_takes_pushes_and_the_repo_it_came_from_gives_the_rest() {
+    let w = World::new();
+    // o/a is alice's fork of up/a, which has moved on since.
+    let upstream = w.dir.path().join("hub/up/a.git");
+    git(w.dir.path(), &["clone", "-q", "--bare", w.hub("o/a").to_str().unwrap(), upstream.to_str().unwrap()]);
+    git(&upstream, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    let human = w.dir.path().join("upstream-work");
+    git(w.dir.path(), &["clone", "-q", upstream.to_str().unwrap(), human.to_str().unwrap()]);
+    let ahead = w.commit(&human, "upstream moved on");
+    git(&human, &["push", "-q", "origin", "main"]);
+    w.broker
+        .db
+        .conn()
+        .execute("UPDATE github_repo_entries SET upstream = 'up/a', upstream_default = 'main'", [])
+        .unwrap();
+    let fork_main = w.hub_ref("o/a", "main").unwrap();
+    assert_ne!(fork_main, ahead);
+
+    // The default branch, and any other without the prefix, come from up/a.
+    let dir = w.checkout("work");
+    let text = w.ok("github_fetch", json!({"workspace": dir}));
+    assert_eq!(text, format!("origin/main is now at {}", &ahead[..12]));
+    assert_eq!(git(&dir, &["rev-parse", "origin/main"]), ahead);
+    // Pushes go to the fork, and nothing is written to up/a.
+    git(&dir, &["checkout", "-q", "-b", "daniel/x", "origin/main"]);
+    let one = w.commit(&dir, "one");
+    assert_eq!(w.push(&dir, false), (format!("created daniel/x at {}", &one[..12]), false));
+    assert_eq!(w.hub_ref("o/a", "daniel/x"), Some(one.clone()));
+    assert_eq!(git(&upstream, &["for-each-ref", "--format=%(refname)"]), "refs/heads/main");
+    assert_eq!(w.hub_ref("o/a", "main"), Some(fork_main));
+    // The agents' own branches are read from the fork.
+    let other = w.checkout("other");
+    w.ok("github_fetch", json!({"workspace": other, "branch": "daniel/x"}));
+    assert_eq!(git(&other, &["rev-parse", "origin/daniel/x"]), one);
+    w.assert_clean();
+
+    // Once the work is merged in up/a, a branch someone re-created under the old name is not
+    // the agent's to rewrite.
+    git(&human, &["pull", "-q", w.hub("o/a").to_str().unwrap(), "daniel/x"]);
+    git(&human, &["push", "-q", "origin", "main"]);
+    let theirs = w.commit(&human, "someone else's work");
+    git(&human, &["push", "-q", "-f", w.hub("o/a").to_str().unwrap(), "HEAD:daniel/x"]);
+    w.ok("github_fetch", json!({"workspace": dir, "branch": "daniel/x"}));
+    git(&dir, &["reset", "-q", "--hard", "origin/main"]);
+    w.commit(&dir, "rewritten");
+    let (text, is_error) = w.push(&dir, true);
+    assert!(is_error && text.contains("had gone into the default branch of up/a"), "{text}");
+    assert_eq!(w.hub_ref("o/a", "daniel/x"), Some(theirs));
+
+    // Work that went into up/a some other way, squashed or into another branch, shows in its
+    // pull requests only. Here someone added to the agent's branch, which alone is fine.
+    git(&dir, &["checkout", "-q", "-b", "daniel/y", "origin/main"]);
+    w.commit(&dir, "y one");
+    let push =
+        |force: bool| w.tool("github_push", json!({"workspace": dir, "branch": "daniel/y", "force": force}));
+    assert!(!push(false).1);
+    let fork = w.dir.path().join("fork-work");
+    git(
+        w.dir.path(),
+        &["clone", "-q", "-b", "daniel/y", w.hub("o/a").to_str().unwrap(), fork.to_str().unwrap()],
+    );
+    w.commit(&fork, "a reviewer's fixup");
+    git(&fork, &["push", "-q", "origin", "daniel/y"]);
+    w.ok("github_fetch", json!({"workspace": dir, "branch": "daniel/y"}));
+    git(&dir, &["reset", "-q", "--hard", "origin/main"]);
+    w.commit(&dir, "y rewritten");
+    // Not knowing counts as no.
+    let (text, is_error) = push(true);
+    assert!(is_error && text.contains("could not be compared with the pull requests of up/a"), "{text}");
+    let merged = |at: Value| {
+        json!([{"number": 9, "merged_at": at, "base": {"ref": "release", "repo": {"id": 1}},
+                "head": {"ref": "daniel/y", "repo": {"id": 5, "full_name": "o/a"}}}])
+    };
+    w.api.on("GET /repos/up/a/pulls", merged(json!("2026-01-01T00:00:00Z")));
+    let (text, is_error) = push(true);
+    assert!(is_error && text.contains("had gone into release of up/a (pull request #9)"), "{text}");
+    // A PR that was closed without merging changes nothing.
+    w.api.on("GET /repos/up/a/pulls", merged(Value::Null));
+    let (text, is_error) = push(true);
+    assert!(!is_error, "{text}");
+}
+
+#[test]
+fn a_renamed_repo_keeps_its_mirror() {
+    let w = World::new();
+    let dir = w.clone("work");
+    w.commit(&dir, "one");
+    assert!(!w.push(&dir, false).1);
+    // Renamed on GitHub, and a token check stored the new name.
+    std::fs::rename(w.hub("o/a"), w.hub("o/renamed")).unwrap();
+    w.broker.db.conn().execute("UPDATE github_repo_entries SET full_name = 'o/renamed'", []).unwrap();
+    w.broker.github.renamed(w.alice_repo, "o/a", "o/renamed").unwrap();
+    // A mirror that is for some other repo is not taken over.
+    assert!(w.broker.github.renamed(w.alice_repo, "o/b", "o/renamed").is_err());
+    let two = w.commit(&dir, "two");
+    let (text, is_error) = w.push(&dir, false);
+    assert!(!is_error, "{text}");
+    assert_eq!(w.hub_ref("o/renamed", "daniel/x"), Some(two));
+}
+
 /// A human's clone of the hub, on `branch`.
 fn human_clone(w: &World, name: &str, branch: &str) -> std::path::PathBuf {
     let human = w.dir.path().join(name);

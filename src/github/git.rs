@@ -65,6 +65,21 @@ impl GitHub {
 }
 
 impl Mirror<'_> {
+    /// For a fork, the repo it was forked from, as git is told to read from it.
+    pub fn upstream(&self) -> Option<String> {
+        let entry = self.entry;
+        entry.is_fork().then(|| format!("{}{}.git", self.gh.endpoints.git, entry.upstream))
+    }
+
+    /// Where a branch is read from. A fork has the agents' own branches; all others are
+    /// those of the repo it was forked from.
+    pub fn source(&self, branch: &str) -> String {
+        match self.upstream() {
+            Some(upstream) if !branch.starts_with(&self.entry.branch_prefix) => upstream,
+            _ => "origin".into(),
+        }
+    }
+
     /// Runs git without the token.
     pub fn git(&self, args: &[&str]) -> Result<Done> {
         self.run(args, false)
