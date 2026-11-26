@@ -58,6 +58,16 @@ fn encode(s: &str) -> String {
     out
 }
 
+/// The start of a list.
+pub struct Paged {
+    pub items: Vec<Value>,
+    /// GitHub has more than was read.
+    pub cut: bool,
+}
+
+/// How many entries of a list are read at most.
+pub const MAX_ITEMS: usize = PAGE * MAX_PAGES;
+
 /// Scheme, host and port of a URL.
 fn origin(url: &str) -> Option<&str> {
     let start = url.find("://")? + 3;
@@ -76,8 +86,9 @@ impl Api<'_> {
 
     /// All items of a list, up to [`MAX_PAGES`] pages. `key` names the list if it is wrapped
     /// in an object.
-    pub fn paged(&self, path: &str, query: &[(&str, &str)], key: Option<&str>) -> Result<Vec<Value>> {
+    pub fn paged(&self, path: &str, query: &[(&str, &str)], key: Option<&str>) -> Result<Paged> {
         let mut items = Vec::new();
+        let mut cut = false;
         for page in 1..=MAX_PAGES {
             let (per_page, page) = (PAGE.to_string(), page.to_string());
             let mut query = query.to_vec();
@@ -90,11 +101,12 @@ impl Api<'_> {
             let Value::Array(list) = list else { break };
             let full = list.len() >= PAGE;
             items.extend(list);
+            cut = full;
             if !full {
                 break;
             }
         }
-        Ok(items)
+        Ok(Paged { items, cut })
     }
 
     /// A plain-text resource that GitHub serves from a storage host.
@@ -145,8 +157,10 @@ impl Api<'_> {
                 let Some(target) = target else { return fail("redirect without a target".into()) };
                 url = if target.starts_with('/') && !target.starts_with("//") {
                     format!("{}{target}", origin(&url).unwrap_or(""))
-                } else {
+                } else if target.starts_with("https://") || target.starts_with("http://") {
                     target.to_string()
+                } else {
+                    return fail("redirect to a target that is not supported".into());
                 };
                 redirects += 1;
                 continue;

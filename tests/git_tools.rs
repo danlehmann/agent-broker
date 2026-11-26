@@ -45,7 +45,61 @@ fn push_decision_table() {
     w.assert_clean();
     let audit = w.broker.db.audit_rows().unwrap();
     let forced = audit.iter().find(|r| r["detail"].as_str().unwrap().contains("forced")).unwrap();
-    assert!(forced["detail"].as_str().unwrap().contains(&format!("{two} -> {three}")));
+    // First in the entry, so that a long branch name cannot push the ids out of it.
+    let start = format!("forced, full ids: {two} -> {three}; ");
+    assert!(forced["detail"].as_str().unwrap().starts_with(&start));
+}
+
+/// A human's clone of the hub, on `branch`.
+fn human_clone(w: &World, name: &str, branch: &str) -> std::path::PathBuf {
+    let human = w.dir.path().join(name);
+    git(w.dir.path(), &["clone", "-q", w.hub("o/a").to_str().unwrap(), human.to_str().unwrap()]);
+    git(&human, &["checkout", "-q", branch]);
+    human
+}
+
+#[test]
+fn force_is_lost_when_someone_else_makes_the_branch_anew() {
+    let refused = "no longer continues what this tool pushed there";
+    let force_after_fetch = |w: &World, dir: &std::path::Path| {
+        w.ok("github_fetch", json!({"workspace": dir, "branch": "daniel/x"}));
+        git(dir, &["reset", "-q", "--hard", "origin/main"]);
+        w.commit(dir, "rewrite");
+        w.push(dir, true)
+    };
+
+    // Deleted, then created again from unrelated work.
+    let w = World::new();
+    let dir = w.clone("work");
+    w.commit(&dir, "one");
+    assert!(!w.push(&dir, false).1);
+    let human = human_clone(&w, "human", "main");
+    git(&human, &["push", "-q", "origin", ":daniel/x"]);
+    git(&human, &["checkout", "-q", "-b", "daniel/x"]);
+    let theirs = w.commit(&human, "human work under the old name");
+    git(&human, &["push", "-q", "origin", "daniel/x"]);
+    let (text, is_error) = force_after_fetch(&w, &dir);
+    assert!(is_error && text.contains(refused), "{text}");
+    assert_eq!(w.hub_ref("o/a", "daniel/x"), Some(theirs.clone()));
+    // Building on it is fine, and makes the branch the agent's to rewrite again.
+    git(&dir, &["reset", "-q", "--hard", "origin/daniel/x"]);
+    w.commit(&dir, "on top");
+    assert!(!w.push(&dir, false).1);
+    git(&dir, &["commit", "-q", "--amend", "-m", "on top, reworded"]);
+    assert!(!w.push(&dir, true).1);
+
+    // Merged, deleted, then created again from main with new work.
+    let w = World::new();
+    let dir = w.clone("work");
+    w.commit(&dir, "one");
+    assert!(!w.push(&dir, false).1);
+    let human = human_clone(&w, "human", "daniel/x");
+    git(&human, &["push", "-q", "origin", "daniel/x:main", ":daniel/x"]);
+    let theirs = w.commit(&human, "new work after the merge");
+    git(&human, &["push", "-q", "origin", "daniel/x"]);
+    let (text, is_error) = force_after_fetch(&w, &dir);
+    assert!(is_error && text.contains(refused), "{text}");
+    assert_eq!(w.hub_ref("o/a", "daniel/x"), Some(theirs));
 }
 
 #[test]
@@ -75,9 +129,7 @@ fn force_does_not_drop_commits_the_checkout_has_not_seen() {
     w.commit(&dir, "one");
     w.push(&dir, false);
     // The human adds a commit.
-    let human = w.dir.path().join("human");
-    git(w.dir.path(), &["clone", "-q", w.hub("o/a").to_str().unwrap(), human.to_str().unwrap()]);
-    git(&human, &["checkout", "-q", "daniel/x"]);
+    let human = human_clone(&w, "human", "daniel/x");
     let theirs = w.commit(&human, "human work");
     git(&human, &["push", "-q", "origin", "daniel/x"]);
 

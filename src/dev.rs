@@ -23,6 +23,9 @@ fn seed(
     what: &str,
     flags: &Flags,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !matches!(what, "add-user" | "add-repo" | "link-code" | "confirm") {
+        return Err("dev: add-user, add-repo, link-code or confirm".into());
+    }
     let name = flags.need("user")?;
     if what == "add-user" {
         db.add_user(name, true)?;
@@ -40,6 +43,9 @@ fn seed(
             let mut token = String::new();
             std::io::stdin().lock().read_line(&mut token)?;
             let token = token.trim();
+            if token.is_empty() {
+                return Err("no token given".into());
+            }
             let home = platform::own_home().ok_or("no home directory")?;
             let github = GitHub::new(Endpoints::github(), data, home);
             let (full_name, default_branch) = github.look_up_repo(repo, token)?;

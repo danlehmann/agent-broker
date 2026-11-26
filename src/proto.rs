@@ -29,14 +29,19 @@ pub fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Map<String, 
     }
 }
 
-/// Writes one message; the caller writes the blob bytes after it, if it announced any.
-pub fn write_message(writer: &mut impl Write, message: &Value) -> io::Result<()> {
+/// One message as the line that goes over the socket.
+pub fn encode(message: &Value) -> io::Result<Vec<u8>> {
     let mut line = serde_json::to_vec(message)?;
     line.push(b'\n');
     if line.len() as u64 > MAX_LINE {
         return Err(invalid("message too long"));
     }
-    writer.write_all(&line)?;
+    Ok(line)
+}
+
+/// Writes one message; the caller writes the blob bytes after it, if it announced any.
+pub fn write_message(writer: &mut impl Write, message: &Value) -> io::Result<()> {
+    writer.write_all(&encode(message)?)?;
     writer.flush()
 }
 

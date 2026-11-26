@@ -53,6 +53,8 @@ CREATE TABLE github_repo_entries (
 CREATE TABLE github_created_branches (
     resource_id INTEGER NOT NULL REFERENCES resources ON DELETE CASCADE,
     branch TEXT NOT NULL,
+    -- the commit the broker last pushed there; NULL if recorded before this was kept
+    tip TEXT,
     PRIMARY KEY (resource_id, branch)
 );
 CREATE TABLE linked_accounts (
@@ -93,7 +95,7 @@ CREATE TABLE audit (
 CREATE TABLE settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -169,6 +171,10 @@ impl Db {
                 tx.execute_batch(SCHEMA)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
+            1 => {
+                tx.execute_batch("ALTER TABLE github_created_branches ADD COLUMN tip TEXT")?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
             SCHEMA_VERSION => {}
             v => return refuse(format!("database has unknown version {v}")),
         }
@@ -239,19 +245,34 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn branch_created(&self, resource_id: i64, branch: &str) -> Result<bool> {
-        Ok(self.conn().query_row(
-            "SELECT EXISTS (SELECT 1 FROM github_created_branches
-             WHERE resource_id = ?1 AND branch = ?2)",
-            params![resource_id, branch],
-            |r| r.get(0),
-        )?)
+    /// For a branch that was created through the broker: the commit the broker last pushed
+    /// there, if known. `None` if the branch was not created through the broker.
+    pub fn created_branch(&self, resource_id: i64, branch: &str) -> Result<Option<Option<String>>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT tip FROM github_created_branches WHERE resource_id = ?1 AND branch = ?2",
+                params![resource_id, branch],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
-    pub fn record_branch(&self, resource_id: i64, branch: &str) -> Result<()> {
+    /// Records that the broker created `branch` at `tip`.
+    pub fn record_branch(&self, resource_id: i64, branch: &str, tip: &str) -> Result<()> {
         self.conn().execute(
-            "INSERT OR IGNORE INTO github_created_branches VALUES (?1, ?2)",
-            params![resource_id, branch],
+            "INSERT OR REPLACE INTO github_created_branches (resource_id, branch, tip)
+             VALUES (?1, ?2, ?3)",
+            params![resource_id, branch, tip],
+        )?;
+        Ok(())
+    }
+
+    /// Records a later push to a branch the broker created; does nothing for other branches.
+    pub fn record_push(&self, resource_id: i64, branch: &str, tip: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE github_created_branches SET tip = ?3 WHERE resource_id = ?1 AND branch = ?2",
+            params![resource_id, branch, tip],
         )?;
         Ok(())
     }
@@ -359,7 +380,8 @@ impl Db {
         let claim: Option<(i64, String)> = tx
             .query_row(
                 "SELECT id, claimed_name FROM link_codes
-                 WHERE user_id = ?1 AND claimed_uid = ?2 AND NOT confirmed AND expires > ?3",
+                 WHERE user_id = ?1 AND claimed_uid = ?2 AND NOT confirmed AND expires > ?3
+                 ORDER BY id LIMIT 1",
                 params![user_id, uid, now()],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -367,6 +389,14 @@ impl Db {
         let Some((id, name)) = claim else {
             return refuse("no unexpired claim by this account");
         };
+        let linked: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM linked_accounts WHERE uid = ?1 AND unix_name = ?2)",
+            params![uid, name],
+            |r| r.get(0),
+        )?;
+        if linked {
+            return refuse("this unix account is already linked");
+        }
         // A link left over from a deleted account whose uid was reused is replaced.
         tx.execute("DELETE FROM linked_accounts WHERE uid = ?1 AND unix_name <> ?2", params![uid, name])?;
         tx.execute(
@@ -472,6 +502,60 @@ mod tests {
         db.claim_link_code(&stale, 5004, "d").unwrap();
         db.conn().execute("UPDATE link_codes SET expires = 0", []).unwrap();
         assert!(db.confirm_link(bob, 5004).is_err());
+    }
+
+    #[test]
+    fn a_second_claim_by_a_linked_account_is_refused_on_confirmation() {
+        let (_dir, db) = db();
+        let user = db.add_user("alice", false).unwrap();
+        for _ in 0..2 {
+            let code = db.new_link_code(user).unwrap();
+            db.claim_link_code(&code, 1001, "agent").unwrap();
+        }
+        db.confirm_link(user, 1001).unwrap();
+        let again = db.confirm_link(user, 1001).unwrap_err();
+        assert_eq!(again.public(), "this unix account is already linked");
+        assert!(db.caller(1001, Some("agent")).unwrap().is_some());
+    }
+
+    #[test]
+    fn created_branches_remember_what_was_pushed() {
+        let (_dir, db) = db();
+        let user = db.add_user("alice", false).unwrap();
+        let repo = db.add_github_repo(user, "t", "o/a", "a/", "main", &[]).unwrap();
+        assert_eq!(db.created_branch(repo, "a/x").unwrap(), None);
+        // Only branches the broker created are tracked.
+        db.record_push(repo, "a/x", "1111").unwrap();
+        assert_eq!(db.created_branch(repo, "a/x").unwrap(), None);
+        db.record_branch(repo, "a/x", "1111").unwrap();
+        db.record_push(repo, "a/x", "2222").unwrap();
+        assert_eq!(db.created_branch(repo, "a/x").unwrap(), Some(Some("2222".into())));
+        db.record_branch(repo, "a/x", "3333").unwrap();
+        assert_eq!(db.created_branch(repo, "a/x").unwrap(), Some(Some("3333".into())));
+    }
+
+    #[test]
+    fn a_version_1_database_is_brought_up_to_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let repo = {
+            let db = Db::open(&path).unwrap();
+            let user = db.add_user("alice", false).unwrap();
+            let repo = db.add_github_repo(user, "t", "o/a", "a/", "main", &[]).unwrap();
+            db.record_branch(repo, "a/x", "1111").unwrap();
+            // Back to how version 1 stored it.
+            let conn = db.conn();
+            conn.execute_batch("ALTER TABLE github_created_branches DROP COLUMN tip").unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            repo
+        };
+        let db = Db::open(&path).unwrap();
+        // Known as created, but with nothing to compare against, so force is refused.
+        assert_eq!(db.created_branch(repo, "a/x").unwrap(), Some(None));
+        db.record_push(repo, "a/x", "2222").unwrap();
+        assert_eq!(db.created_branch(repo, "a/x").unwrap(), Some(Some("2222".into())));
+        drop(db);
+        Db::open(&path).unwrap();
     }
 
     #[test]

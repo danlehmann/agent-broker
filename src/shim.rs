@@ -52,17 +52,26 @@ impl Client {
         let id = self.next_id;
         self.next_id += 1;
         let mut request = json!({"id": id, "op": op, "args": args});
+        // What can fail before anything is sent fails here, without waiting for a reply.
+        let mut blob = match blob {
+            None => None,
+            Some(path) => {
+                let file = File::open(path)?;
+                let len = file.metadata()?.len();
+                request["blob_len"] = json!(len);
+                Some((file, len))
+            }
+        };
+        let Ok(line) = proto::encode(&request) else {
+            return refuse("the request is larger than agent-broker accepts (1 MiB); shorten the text");
+        };
         let sent = (|| {
             let mut stream = self.reader.get_ref();
-            match blob {
-                None => proto::write_message(&mut stream, &request),
-                Some(path) => {
-                    let mut file = File::open(path)?;
-                    let len = file.metadata()?.len();
-                    request["blob_len"] = json!(len);
-                    proto::write_message(&mut stream, &request)?;
-                    proto::copy_exact(&mut file, &mut stream, len)
-                }
+            stream.write_all(&line)?;
+            stream.flush()?;
+            match &mut blob {
+                None => Ok(()),
+                Some((file, len)) => proto::copy_exact(file, &mut stream, *len),
             }
         })();
         // Even if sending failed there may be a reply: the daemon refuses large blobs early.

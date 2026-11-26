@@ -2,7 +2,7 @@
 
 use regex::{Regex, RegexBuilder};
 
-use super::api::{Api, text};
+use super::api::{Api, MAX_ITEMS, text};
 use crate::error::{Result, refuse};
 use crate::spec::{Args, int_arg, str_arg};
 
@@ -16,6 +16,9 @@ pub fn status(api: &Api, args: &Args) -> Result<String> {
     };
     let mut out = vec![format!("commit {sha}")];
     let runs = api.paged("/actions/runs", &[("head_sha", &sha)], Some("workflow_runs"))?;
+    let more = |cut: bool, what: &str| cut.then(|| format!("(only the first {MAX_ITEMS} {what} are shown)"));
+    out.extend(more(runs.cut, "runs"));
+    let runs = runs.items;
     if runs.is_empty() {
         out.push("no workflow runs for this commit (yet)".into());
     }
@@ -31,6 +34,8 @@ pub fn status(api: &Api, args: &Args) -> Result<String> {
         ));
         let path = format!("/actions/runs/{}/jobs", run["id"]);
         let jobs = api.paged(&path, &[("filter", "latest")], Some("jobs"))?;
+        out.extend(more(jobs.cut, "jobs of this run").map(|note| format!("  {note}")));
+        let jobs = jobs.items;
         let (fine, other): (Vec<_>, Vec<_>) =
             jobs.iter().partition(|j| matches!(text(&j["conclusion"]), "success" | "skipped"));
         out.push(format!("  {} of {} jobs succeeded or were skipped", fine.len(), jobs.len()));

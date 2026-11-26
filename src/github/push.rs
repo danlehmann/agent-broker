@@ -42,6 +42,21 @@ fn commit_arg(local: &Map<String, Value>, name: &str) -> Result<Option<String>> 
     }
 }
 
+/// Whether the branch now at `old` is still the one the broker last pushed `last` to. The
+/// name alone does not say so: the branch may have been deleted and created again.
+fn still_own(mirror: &Mirror, default: &str, last: Option<&str>, old: &str) -> Result<bool> {
+    let Some(last) = last else { return Ok(false) };
+    if last == old {
+        return Ok(true);
+    }
+    // Others may add commits on top; the caller must have seen them, which is checked later.
+    if !mirror.is_ancestor(last, old)? {
+        return Ok(false);
+    }
+    // What the broker pushed was merged, so a branch that goes on from there is new work.
+    Ok(!mirror.is_ancestor(last, default)?)
+}
+
 /// The branch's commit on GitHub.
 fn remote_tip(mirror: &Mirror, branch: &str) -> Result<Option<String>> {
     let name = format!("refs/heads/{branch}");
@@ -147,9 +162,16 @@ impl GitHub {
                         sha12(old)
                     ));
                 }
-                if !db.branch_created(entry.resource_id, branch)? {
+                let Some(last_pushed) = db.created_branch(entry.resource_id, branch)? else {
                     return refuse(format!(
                         "{branch} was not first pushed through this tool, so its history cannot be rewritten; ask the human"
+                    ));
+                };
+                let default = fetched_ref(&entry.default_branch);
+                if !still_own(&mirror, &default, last_pushed.as_deref(), old)? {
+                    return refuse(format!(
+                        "{branch} on GitHub ({}) no longer continues what this tool pushed there: it was re-created, rewritten or merged by someone else, so its history cannot be rewritten. Fetch it and add your commits on top, or ask the human",
+                        sha12(old)
                     ));
                 }
                 // Guards against accidents only: the caller reports what it last saw.
@@ -171,13 +193,19 @@ impl GitHub {
         let text = match &push.old {
             None => {
                 let mut text = format!("created {branch} at {}", sha12(&new));
-                if let Err(e) = db.record_branch(entry.resource_id, branch) {
+                if let Err(e) = db.record_branch(entry.resource_id, branch, &new) {
                     eprintln!("cannot record {branch} as created: {e}");
                     text.push_str(" (but force=true will not work for it: recording it failed)");
                 }
                 text
             }
-            Some(old) => format!("updated {branch} {} -> {}", sha12(old), sha12(&new)),
+            Some(old) => {
+                // Without this record a later force=true is refused, which is the safe side.
+                if let Err(e) = db.record_push(entry.resource_id, branch, &new) {
+                    eprintln!("cannot record the push to {branch}: {e}");
+                }
+                format!("updated {branch} {} -> {}", sha12(old), sha12(&new))
+            }
         };
         Ok(Pushed { text, tip: new, forced })
     }

@@ -2,7 +2,7 @@
 
 use serde_json::{Map, Value, json};
 
-use super::api::{Api, text};
+use super::api::{Api, MAX_ITEMS, text};
 use super::rules::check_own_pr;
 use crate::error::{Result, refuse};
 use crate::spec::{Args, int_arg, str_arg};
@@ -116,8 +116,9 @@ pub fn list_state(args: &Args) -> Result<&str> {
 pub fn list(api: &Api, args: &Args) -> Result<String> {
     let state = list_state(args)?;
     let prefix = &api.entry.branch_prefix;
-    let lines: Vec<String> = api
-        .paged("/pulls", &[("state", state)], None)?
+    let found = api.paged("/pulls", &[("state", state)], None)?;
+    let mut lines: Vec<String> = found
+        .items
         .iter()
         .filter(|pr| text(&pr["head"]["ref"]).starts_with(prefix.as_str()))
         .map(|pr| {
@@ -127,7 +128,12 @@ pub fn list(api: &Api, args: &Args) -> Result<String> {
         })
         .collect();
     if lines.is_empty() {
-        return Ok(format!("no {state} PRs from {prefix}* branches"));
+        lines.push(format!("no {state} PRs from {prefix}* branches"));
+    }
+    if found.cut {
+        lines.push(format!(
+            "(only the {MAX_ITEMS} newest {state} PRs of the repo were searched; older ones are missing here)"
+        ));
     }
     Ok(lines.join("\n"))
 }
@@ -161,10 +167,13 @@ pub fn view(api: &Api, args: &Args) -> Result<String> {
         Some(text(&pr["body"])).filter(|b| !b.is_empty()).unwrap_or("(no description)"),
     );
     let mut section = |heading: &str, path: String, item: &dyn Fn(&Value) -> String| -> Result<()> {
-        let items = api.paged(&path, &[], None)?;
-        if !items.is_empty() {
-            let lines: Vec<String> = items.iter().map(item).collect();
+        let found = api.paged(&path, &[], None)?;
+        if !found.items.is_empty() {
+            let lines: Vec<String> = found.items.iter().map(item).collect();
             out.push_str(&format!("\n\n## {heading}\n{}", lines.join("\n")));
+        }
+        if found.cut {
+            out.push_str(&format!("\n(only the first {MAX_ITEMS} are shown; there are more)"));
         }
         Ok(())
     };

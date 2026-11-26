@@ -17,7 +17,7 @@ use crate::spec::{self, Args, Flow, Tool, str_arg};
 const UNLINKED: &str =
     "this unix account is not linked to a user; ask the human to link it in the agent-broker web UI";
 /// How long an upload may take to start after its first step.
-const PENDING_LIFETIME: Duration = Duration::from_secs(600);
+pub const PENDING_LIFETIME: Duration = Duration::from_secs(600);
 const REFUSALS_PER_MINUTE: u32 = 60;
 const CLAIMS_PER_MINUTE: u32 = 5;
 
@@ -82,6 +82,13 @@ pub struct Pending {
     push: PendingPush,
 }
 
+impl Pending {
+    /// Whether the second step comes too late.
+    pub fn expired(&self) -> bool {
+        self.started.elapsed() > PENDING_LIFETIME
+    }
+}
+
 /// What an operation sends back.
 pub struct Reply {
     pub value: Value,
@@ -136,9 +143,16 @@ impl Broker {
         Ok(Authorized { caller, tool, repos, entry })
     }
 
-    /// Authorizes a call and writes its first audit entry.
-    fn start(&self, uid: u32, call_id: &str, tool: &str, args: &Args) -> Result<Authorized> {
-        match self.authorize(uid, tool, args) {
+    /// Authorizes a call and writes its first audit entry. `upload` says whether the caller
+    /// uses the two-step form.
+    fn start(&self, uid: u32, call_id: &str, tool: &str, args: &Args, upload: bool) -> Result<Authorized> {
+        let authorized =
+            self.authorize(uid, tool, args).and_then(|auth| match (auth.tool.flow == Flow::Upload, upload) {
+                (true, false) => refuse(format!("{} needs two steps", auth.tool.name)),
+                (false, true) => refuse(format!("{} needs only one step", auth.tool.name)),
+                _ => Ok(auth),
+            });
+        match authorized {
             Ok(auth) => {
                 self.db.audit(&AuditEntry {
                     event: "start",
@@ -152,12 +166,15 @@ impl Broker {
                 })?;
                 Ok(auth)
             }
-            Err(e) => {
-                let e = self.scrub_refusal(uid, e);
-                self.audit_refusal(uid, call_id, tool, &e);
-                Err(e)
-            }
+            Err(e) => Err(self.refused(uid, call_id, tool, e)),
         }
+    }
+
+    /// Scrubs and audits the refusal of a call that never started.
+    fn refused(&self, uid: u32, call_id: &str, tool: &str, e: Error) -> Error {
+        let e = self.scrub_refusal(uid, e);
+        self.audit_refusal(uid, call_id, tool, &e);
+        e
     }
 
     /// A refusal may quote the caller's input, which may contain a token it got elsewhere.
@@ -223,7 +240,7 @@ impl Broker {
         match result {
             Ok(mut out) => {
                 out.text = clean(&out.text);
-                self.audit_end(uid, call_id, auth, true, &format!("{}{note}", out.text));
+                self.audit_end(uid, call_id, auth, true, &format!("{note}{}", out.text));
                 Ok(out)
             }
             Err(e) => {
@@ -286,12 +303,9 @@ impl Broker {
 
     /// Runs a one-step tool.
     pub fn call(&self, uid: u32, request: &Args) -> Result<Reply> {
-        let (tool, args, local) = call_parts(request)?;
-        if spec::find(tool).is_some_and(|t| t.flow == Flow::Upload) {
-            return refuse(format!("{tool} needs two steps"));
-        }
         let call_id = random_base32(26);
-        let auth = self.start(uid, &call_id, tool, args)?;
+        let (tool, args, local) = call_parts(request).map_err(|e| self.refused(uid, &call_id, "", e))?;
+        let auth = self.start(uid, &call_id, tool, args, false)?;
         let result = match &auth.entry {
             None => Ok(Output::from(github::list_repos(&auth.repos))),
             Some(entry) => {
@@ -304,12 +318,9 @@ impl Broker {
 
     /// First step of an upload. Returns the pending call unless it is already finished.
     pub fn begin(&self, uid: u32, request: &Args) -> Result<(Reply, Option<Pending>)> {
-        let (tool, args, local) = call_parts(request)?;
-        if spec::find(tool).is_some_and(|t| t.flow != Flow::Upload) {
-            return refuse(format!("{tool} needs only one step"));
-        }
         let call_id = random_base32(26);
-        let auth = self.start(uid, &call_id, tool, args)?;
+        let (tool, args, local) = call_parts(request).map_err(|e| self.refused(uid, &call_id, "", e))?;
+        let auth = self.start(uid, &call_id, tool, args, true)?;
         let begun = auth.entry().and_then(|entry| self.github.push_begin(entry, args, local));
         match begun {
             Ok(Begun::Pending(push)) => {
@@ -356,14 +367,15 @@ impl Broker {
         };
         let mut forced = String::new();
         let mut tip = String::new();
-        let result = if pending.started.elapsed() > PENDING_LIFETIME {
+        let result = if pending.expired() {
             refuse("the upload took too long to start; try again")
         } else {
             auth.entry()
                 .and_then(|entry| self.github.push_finish(&self.db, entry, call_id, &pending.push, blob))
                 .map(|pushed| {
                     if let Some((old, new)) = pushed.forced {
-                        forced = format!(" (forced, full ids: {old} -> {new})");
+                        // First, so that cutting the entry never loses the ids.
+                        forced = format!("forced, full ids: {old} -> {new}; ");
                     }
                     tip = pushed.tip;
                     Output::from(pushed.text)

@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 
 use crate::db::Db;
-use crate::dispatch::{Broker, Pending, Reply, log};
+use crate::dispatch::{Broker, PENDING_LIFETIME, Pending, Reply, log};
 use crate::error::{Error, Result, refuse};
 use crate::github::{Endpoints, GitHub};
 use crate::platform::{self, Kernel};
@@ -181,6 +181,9 @@ fn connection(broker: &Broker, stream: &UnixStream, uid: u32) -> std::io::Result
     let mut reader = BufReader::new(stream);
     while let Some(request) = proto::read_message(&mut reader)? {
         session.request(&mut reader, stream, &request)?;
+        // Between the two steps of an upload the caller is busy packing, not idle.
+        let wait = if session.pending.is_some() { PENDING_LIFETIME } else { IDLE };
+        stream.set_read_timeout(Some(wait))?;
     }
     Ok(())
 }
@@ -216,6 +219,9 @@ impl Session<'_> {
             Some(len) => match self.receive(reader, op, args, len) {
                 Ok(file) => Some(file),
                 Err(e) => {
+                    if let Some(pending) = self.pending.take() {
+                        self.broker.abandon(self.uid, &pending, e.public());
+                    }
                     // The bytes are still in the pipe, so the connection cannot go on.
                     proto::write_message(&mut stream, &failure(&id, e.public()))?;
                     return Err(std::io::Error::other("blob refused"));
@@ -254,6 +260,10 @@ impl Session<'_> {
     ) -> Result<tempfile::NamedTempFile> {
         if op != "tools.finish" || !self.is_pending(args) {
             return refuse("no upload was expected");
+        }
+        // Before reading it: a late upload may be large.
+        if self.pending.as_ref().is_some_and(Pending::expired) {
+            return refuse("the upload took too long to start; try again");
         }
         if len > self.broker.db.max_blob()? {
             return refuse("the upload is larger than the broker's limit; ask the human to raise it");

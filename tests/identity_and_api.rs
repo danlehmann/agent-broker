@@ -235,7 +235,29 @@ fn pagination() {
     for n in 1..=6 {
         w.api.on(&path(n), page(n, 100));
     }
-    assert_eq!(w.ok("github_pr_list", json!({})).lines().count(), 500);
+    // Stopping early is said, also when nothing of what was read matched.
+    let text = w.ok("github_pr_list", json!({}));
+    assert_eq!(text.lines().count(), 501);
+    let note = "(only the 500 newest open PRs of the repo were searched; older ones are missing here)";
+    assert_eq!(text.lines().last(), Some(note));
+    let others = |n: i64| -> Value { (0..100).map(|i| pr(n * 1000 + i, "someone/x", Value::Null)).collect() };
+    for n in 1..=5 {
+        w.api.on(&path(n), others(n));
+    }
+    assert_eq!(w.ok("github_pr_list", json!({})), format!("no open PRs from daniel/* branches\n{note}"));
+
+    w.api.on("GET /repos/o/a/pulls/1", pr(1, "daniel/x", Value::Null));
+    w.api.on("GET /repos/o/a/pulls/1/reviews", json!([]));
+    w.api.on("GET /repos/o/a/issues/1/comments", json!([]));
+    let comment = json!({"id": 5, "user": null, "path": "f", "line": 3, "body": "hm"});
+    for n in 1..=5 {
+        let path = format!("GET /repos/o/a/pulls/1/comments?per_page=100&page={n}");
+        w.api.on(&path, Value::Array(vec![comment.clone(); 100]));
+    }
+    assert!(
+        w.ok("github_pr_view", json!({"number": 1}))
+            .ends_with("\n(only the first 500 are shown; there are more)")
+    );
 }
 
 #[test]
@@ -284,6 +306,10 @@ fn logs_follow_a_redirect_without_the_token() {
     for request in w.storage.seen.lock().unwrap().iter() {
         assert!(!request.headers.contains("authorization"), "{}", request.headers);
     }
+    // A target that cannot be resolved is refused in plain words.
+    w.api.raw("GET /repos/o/a/actions/jobs/5/logs", 302, "Location: blob?sig=1\r\n", "");
+    let text = w.err("github_ci_logs", json!({"job_id": 5}));
+    assert!(text.ends_with("redirect to a target that is not supported"), "{text}");
     // The same host keeps the token, or a renamed repo could not be read.
     w.api.raw("GET /repos/o/a/pulls", 301, "Location: /moved\r\n", "");
     w.api.on("GET /moved", json!([]));
@@ -356,6 +382,23 @@ fn audit_trail() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert!(abandoned());
+    // Using the wrong form of a call is a refusal like any other.
+    let before = w.broker.db.audit_rows().unwrap().len();
+    let mut raw = Raw::connect(&w);
+    let wrong = json!({"name": "github_push", "arguments": {"workspace": "/x", "branch": "daniel/x"}});
+    assert!(raw.error("tools.call", wrong, None).contains("two steps"));
+    assert!(raw.error("tools.call", json!({"name": 7}), None).contains("unknown tool"));
+    let rows = w.broker.db.audit_rows().unwrap();
+    assert_eq!(rows.len(), before + 2);
+    assert!(rows[before..].iter().all(|r| r["event"] == "refused"));
+    assert_eq!(rows[before]["detail"], "github_push needs two steps");
+
+    // A request too large to send fails at once, not after waiting for a reply.
+    let started = std::time::Instant::now();
+    let text = w.err("github_pr_comment", json!({"number": 1, "body": "x".repeat(1024 * 1024)}));
+    assert!(text.contains("larger than agent-broker accepts"), "{text}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
     let mut raw = Raw::connect(&w);
     for _ in 0..200 {
         raw.error("tools.call", json!({"name": "x"}), None);
