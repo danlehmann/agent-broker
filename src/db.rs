@@ -95,7 +95,28 @@ CREATE TABLE audit (
 CREATE TABLE settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
-const SCHEMA_VERSION: i64 = 2;
+/// What version 3 added, for the web UI.
+const WEB_TABLES: &str = "
+CREATE TABLE sessions (
+    -- Only hashes: reading the database must not be enough to take over a session.
+    id_hash BLOB PRIMARY KEY,
+    secret_hash BLOB NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users ON DELETE CASCADE,
+    created INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    last_password INTEGER NOT NULL
+);
+CREATE TABLE one_time_links (
+    token_hash BLOB PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users ON DELETE CASCADE,
+    -- setup or reset
+    purpose TEXT NOT NULL,
+    expires INTEGER NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0
+);
+";
+
+const SCHEMA_VERSION: i64 = 3;
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -174,20 +195,23 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        // A replaced or deleted token does not stay behind in the file's free pages.
+        conn.pragma_update(None, "secure_delete", true)?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        match version {
-            0 => {
-                tx.execute_batch(SCHEMA)?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            }
-            1 => {
-                tx.execute_batch("ALTER TABLE github_created_branches ADD COLUMN tip TEXT")?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            }
-            SCHEMA_VERSION => {}
-            v => return refuse(format!("database has unknown version {v}")),
+        if !(0..=SCHEMA_VERSION).contains(&version) {
+            return refuse(format!("database has unknown version {version}"));
         }
+        if version == 0 {
+            tx.execute_batch(SCHEMA)?;
+        }
+        if version == 1 {
+            tx.execute_batch("ALTER TABLE github_created_branches ADD COLUMN tip TEXT")?;
+        }
+        if version < 3 {
+            tx.execute_batch(WEB_TABLES)?;
+        }
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(Db { conn: Mutex::new(conn) })
     }
@@ -320,6 +344,21 @@ impl Db {
     ) -> Result<i64> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let id =
+            Self::insert_github_repo(&tx, user_id, token, full_name, branch_prefix, default_branch, tools)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub(crate) fn insert_github_repo(
+        tx: &rusqlite::Transaction,
+        user_id: i64,
+        token: &str,
+        full_name: &str,
+        branch_prefix: &str,
+        default_branch: &str,
+        tools: &[&str],
+    ) -> Result<i64> {
         let duplicate: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM github_repo_entries g JOIN resources r
              ON r.id = g.resource_id WHERE r.user_id = ?1 AND g.full_name = ?2)",
@@ -345,7 +384,6 @@ impl Db {
             "INSERT INTO github_repo_entries VALUES (?1, ?2, ?3, ?4)",
             params![resource, full_name, branch_prefix, default_branch],
         )?;
-        tx.commit()?;
         Ok(resource)
     }
 
@@ -569,7 +607,11 @@ mod tests {
             db.record_branch(repo, "a/x", "1111").unwrap();
             // Back to how version 1 stored it.
             let conn = db.conn();
-            conn.execute_batch("ALTER TABLE github_created_branches DROP COLUMN tip").unwrap();
+            conn.execute_batch(
+                "ALTER TABLE github_created_branches DROP COLUMN tip;
+                 DROP TABLE sessions; DROP TABLE one_time_links;",
+            )
+            .unwrap();
             conn.pragma_update(None, "user_version", 1).unwrap();
             repo
         };
@@ -578,6 +620,11 @@ mod tests {
         assert_eq!(db.created_branch(repo, "a/x").unwrap(), Some(None));
         db.record_push(repo, "a/x", "2222").unwrap();
         assert_eq!(db.created_branch(repo, "a/x").unwrap(), Some(Some("2222".into())));
+        // And it has what the web UI needs.
+        let user = db.user_id("alice").unwrap().unwrap();
+        let (id, secret) = db.create_session(user).unwrap();
+        assert!(db.session(&id, &secret).unwrap().is_some());
+        db.new_one_time_link(user, "setup").unwrap();
         drop(db);
         Db::open(&path).unwrap();
     }

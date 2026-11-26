@@ -14,8 +14,6 @@
 pub mod cli;
 pub mod daemon;
 pub mod db;
-#[cfg(feature = "dev-seed")]
-pub mod dev;
 pub mod dispatch;
 pub mod error;
 pub mod github;
@@ -24,3 +22,4 @@ pub mod proto;
 pub mod scrub;
 pub mod shim;
 pub mod spec;
+pub mod web;

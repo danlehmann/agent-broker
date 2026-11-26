@@ -65,6 +65,14 @@ pub fn check_own_pr(pr: &Value, number: i64, entry: &RepoEntry) -> Result<()> {
     refuse(format!("PR #{number} is not from a {prefix}* branch of {repo}"))
 }
 
+/// Refuses a prefix under which the default branch itself could be pushed.
+pub fn check_prefix_spares(prefix: &str, default_branch: &str) -> Result<()> {
+    if !default_branch.is_empty() && default_branch.starts_with(prefix) {
+        return refuse(format!("The prefix {prefix} would cover the default branch {default_branch}."));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn test_entry() -> RepoEntry {
     RepoEntry {

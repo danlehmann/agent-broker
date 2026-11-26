@@ -50,6 +50,35 @@ fn push_decision_table() {
     assert!(forced["detail"].as_str().unwrap().starts_with(&start));
 }
 
+#[test]
+fn the_branch_that_is_the_default_on_github_now_is_not_pushed() {
+    let w = World::new();
+    let dir = w.clone("work");
+    w.commit(&dir, "one");
+    assert!(!w.push(&dir, false).1);
+    // The entry still says main, but on GitHub the default branch was changed since.
+    git(&w.hub("o/a"), &["symbolic-ref", "HEAD", "refs/heads/daniel/x"]);
+    let two = w.commit(&dir, "two");
+    let (text, is_error) = w.push(&dir, false);
+    assert!(is_error && text.contains("daniel/x is the repo's default branch on GitHub now"), "{text}");
+    assert_ne!(w.hub_ref("o/a", "daniel/x"), Some(two));
+    w.assert_clean();
+}
+
+#[test]
+fn a_deleted_entry_does_not_get_its_mirror_back() {
+    let w = World::new();
+    let dir = w.clone("work");
+    assert!(w.mirror().exists());
+    // A call that was let in before the entry was deleted would still have its copy of it.
+    w.broker.github.forget(w.alice_repo).unwrap();
+    assert!(!w.mirror().exists());
+    assert!(w.err("github_fetch", json!({"workspace": dir})).contains("this repo entry was deleted"));
+    w.commit(&dir, "one");
+    assert!(w.push(&dir, false).1);
+    assert!(!w.mirror().exists());
+}
+
 /// A human's clone of the hub, on `branch`.
 fn human_clone(w: &World, name: &str, branch: &str) -> std::path::PathBuf {
     let human = w.dir.path().join(name);

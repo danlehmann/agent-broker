@@ -17,6 +17,7 @@ use crate::error::{Error, Result, refuse};
 use crate::github::{Endpoints, GitHub};
 use crate::platform::{self, Kernel};
 use crate::proto;
+use crate::web::{self, Web, auth::Cost};
 
 const IDLE: Duration = Duration::from_secs(120);
 const MAX_CONNECTIONS: usize = 256;
@@ -91,6 +92,16 @@ fn bind(path: &Path) -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
+/// Words on getting a browser to the web UI's socket.
+pub fn how_to_reach(admin_socket: &Path) -> String {
+    format!(
+        "The web UI is served on {socket}. To reach it from your own machine, forward a port to \
+         it, for example with this line for the host in ~/.ssh/config:\n\n    \
+         LocalForward 8443 {socket}\n",
+        socket = admin_socket.display()
+    )
+}
+
 pub fn run(options: &Options) -> Fatal {
     check_not_root()?;
     check_data_dir(&options.data_dir)?;
@@ -106,6 +117,23 @@ pub fn run(options: &Options) -> Fatal {
     let db = Db::open(&options.data_dir.join("broker.db")).map_err(|e| e.to_string())?;
     let github = GitHub::new(Endpoints::github(), &options.data_dir, home);
     let broker = Arc::new(Broker::new(db, github, Box::new(Kernel), platform::own_uid()));
+
+    let admin = options.run_dir.join("admin.sock");
+    let listener = bind(&admin).map_err(|e| format!("{}: {e}", admin.display()))?;
+    let web = Arc::new(Web::new(broker.clone(), Cost::default()));
+    log(&format!("web UI on {}", admin.display()), None);
+    // A fresh install sets itself up: whoever can read this log creates the first admin.
+    if let Some(link) = web.first_run_link().map_err(|e| e.to_string())? {
+        log(
+            &format!(
+                "nobody can log in as an admin yet. {}\nThen open this link to create the first \
+                 admin. It works once, and a restart replaces it:\n\n    http://localhost:8443{link}\n",
+                how_to_reach(&admin)
+            ),
+            None,
+        );
+    }
+    std::thread::spawn(move || web::serve(web, listener));
 
     let socket = options.run_dir.join("agent.sock");
     let listener = bind(&socket).map_err(|e| format!("{}: {e}", socket.display()))?;

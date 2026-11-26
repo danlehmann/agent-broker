@@ -97,15 +97,23 @@ fn still_own(
     }))
 }
 
-/// The branch's commit on GitHub.
+/// The branch's commit on GitHub. Refuses the branch that is the default one there right now:
+/// the entry only knows what it was when the token was last checked.
 fn remote_tip(mirror: &Mirror, branch: &str) -> Result<Option<String>> {
     let name = format!("refs/heads/{branch}");
-    let out = mirror.git_auth_or("cannot reach GitHub", &["ls-remote", "origin", &name])?;
+    let out =
+        mirror.git_auth_or("cannot reach GitHub", &["ls-remote", "--symref", "origin", "HEAD", &name])?;
+    if out.lines().any(|l| l.strip_prefix("ref: ").and_then(|l| l.split_once('\t')) == Some((&name, "HEAD")))
+    {
+        return refuse(format!(
+            "{branch} is the repo's default branch on GitHub now. Its owner should check the token in the web UI, which updates the entry."
+        ));
+    }
     // ls-remote matches trailing path components too, so look for the exact name.
     Ok(out
         .lines()
         .filter_map(|l| l.split_once('\t'))
-        .find(|(_, r)| *r == name)
+        .find(|(sha, r)| *r == name && !sha.starts_with("ref: "))
         .map(|(sha, _)| sha.to_string())
         .filter(|sha| is_commit_id(sha)))
 }
@@ -160,6 +168,8 @@ impl GitHub {
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mirror = self.mirror(entry)?;
         let branch = &push.branch;
+        // Asked again: the default branch may have been changed since the first step.
+        remote_tip(&mirror, branch)?;
         let staging = TempRef { mirror: &mirror, name: format!("refs/staging/{call_id}") };
 
         match bundle {
