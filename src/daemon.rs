@@ -177,6 +177,8 @@ impl Drop for Slot {
     }
 }
 
+const LATE: &str = "the upload took too long to start; try again";
+
 /// How long sending or receiving one blob may take in all.
 const BLOB_TIME: Duration = Duration::from_secs(600);
 
@@ -187,7 +189,7 @@ fn failure(id: &Value, message: &str) -> Value {
 fn connection(broker: &Broker, stream: &UnixStream, uid: u32) -> std::io::Result<()> {
     stream.set_read_timeout(Some(IDLE))?;
     stream.set_write_timeout(Some(IDLE))?;
-    let mut session = Session { broker, uid, pending: None };
+    let mut session = Session { broker, uid, pending: None, late: None };
     let mut reader = BufReader::new(stream);
     loop {
         let request = match proto::read_message(&mut reader) {
@@ -197,10 +199,9 @@ fn connection(broker: &Broker, stream: &UnixStream, uid: u32) -> std::io::Result
                 let timed_out = matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut);
                 if timed_out && let Some(pending) = session.pending.take() {
                     // The caller is still packing. It reads this when it comes back.
-                    let late = "the upload took too long to start; try again";
-                    broker.abandon(uid, &pending, late);
+                    broker.abandon(uid, &pending, LATE);
                     let mut stream = stream;
-                    let _ = proto::write_message(&mut stream, &failure(&Value::Null, late));
+                    let _ = proto::write_message(&mut stream, &failure(&Value::Null, LATE));
                 }
                 return Err(e);
             }
@@ -212,7 +213,8 @@ fn connection(broker: &Broker, stream: &UnixStream, uid: u32) -> std::io::Result
         if session.pending.as_ref().is_some_and(Pending::expired)
             && let Some(pending) = session.pending.take()
         {
-            broker.abandon(uid, &pending, "the upload took too long to start");
+            broker.abandon(uid, &pending, LATE);
+            session.late = Some(pending.call_id);
         }
         stream.set_read_timeout(Some(session.wait()))?;
     }
@@ -223,6 +225,8 @@ struct Session<'a> {
     broker: &'a Broker,
     uid: u32,
     pending: Option<Pending>,
+    /// The call id of an upload that was closed for being too late.
+    late: Option<String>,
 }
 
 impl Drop for Session<'_> {
@@ -302,12 +306,15 @@ impl Session<'_> {
         args: &Map<String, Value>,
         len: u64,
     ) -> Result<tempfile::NamedTempFile> {
+        if op == "tools.finish" && self.is_late(args) {
+            return refuse(LATE);
+        }
         if op != "tools.finish" || !self.is_pending(args) {
             return refuse("no upload was expected");
         }
         // Before reading it: a late upload may be large.
         if self.pending.as_ref().is_some_and(Pending::expired) {
-            return refuse("the upload took too long to start; try again");
+            return refuse(LATE);
         }
         if len > self.broker.db.max_blob()? {
             return refuse("the upload is larger than the broker's limit; ask the human to raise it");
@@ -315,6 +322,11 @@ impl Session<'_> {
         let mut file = tempfile::NamedTempFile::new_in(self.broker.github.tmp())?;
         proto::copy_exact_until(reader, &mut file, len, Instant::now() + BLOB_TIME)?;
         Ok(file)
+    }
+
+    fn is_late(&self, args: &Map<String, Value>) -> bool {
+        let id = args.get("call_id").and_then(Value::as_str);
+        id.is_some() && self.late.as_deref() == id
     }
 
     fn is_pending(&self, args: &Map<String, Value>) -> bool {
@@ -341,6 +353,7 @@ impl Session<'_> {
                 Some(pending) => broker.finish(uid, pending, blob),
                 None => refuse("no such call"),
             },
+            "tools.finish" if self.is_late(args) => refuse(LATE),
             "tools.finish" => refuse("no such call"),
             _ => refuse("unknown operation"),
         }

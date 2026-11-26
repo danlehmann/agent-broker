@@ -83,6 +83,11 @@ fn origin(url: &str) -> Option<&str> {
 }
 
 impl Api<'_> {
+    /// How many more requests this call may make.
+    pub fn requests_left(&self) -> u32 {
+        MAX_REQUESTS.saturating_sub(self.requests.get())
+    }
+
     pub fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Value> {
         self.json("GET", path, query, None)
     }

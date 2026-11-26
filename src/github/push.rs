@@ -50,10 +50,18 @@ const OTHERS: &str = "refs/others/";
 /// name alone does not say so: the branch may have been deleted and created again.
 ///
 /// Returns why not, if not. Whatever cannot be established counts as not.
-fn still_own(mirror: &Mirror, branch: &str, last: Option<&str>, old: &str) -> Result<Option<String>> {
-    let advice = "Its history cannot be rewritten. Fetch it and add your commits on top (after that, force works again), or ask the human";
+fn still_own(
+    mirror: &Mirror,
+    entry: &RepoEntry,
+    branch: &str,
+    last: Option<&str>,
+    old: &str,
+) -> Result<Option<String>> {
+    let advice = "Its history cannot be rewritten; add your commits on top, or ask the human";
     let Some(last) = last else {
-        return Ok(Some(format!("has no record here of what this tool last pushed to it. {advice}")));
+        return Ok(Some(
+            "has no record here of what this tool last pushed to it, so its history cannot be rewritten now. Fetch it and add your commits on top (after that, force works again), or ask the human".into(),
+        ));
     };
     if last == old {
         return Ok(None);
@@ -76,11 +84,15 @@ fn still_own(mirror: &Mirror, branch: &str, last: Option<&str>, old: &str) -> Re
     if !holders.ok {
         return Ok(Some(format!("could not be compared with the repo's other branches. {advice}")));
     }
-    let own = format!("{OTHERS}{branch}");
-    Ok(holders.stdout.lines().find(|name| *name != own).map(|name| {
+    // Not the agents' own branches: one stacked on this one has its commits without any merge.
+    let merged_into = holders
+        .stdout
+        .lines()
+        .filter_map(|name| name.strip_prefix(OTHERS))
+        .find(|name| *name != branch && !name.starts_with(&entry.branch_prefix));
+    Ok(merged_into.map(|name| {
         format!(
-            "was continued by someone else after what this tool pushed there had gone into {}, so it may be a new branch under an old name. {advice}",
-            name.strip_prefix(OTHERS).unwrap_or(name)
+            "was continued by someone else after what this tool pushed there had gone into {name}, so it may be a new branch under an old name. {advice}"
         )
     }))
 }
@@ -195,7 +207,7 @@ impl GitHub {
                         "{branch} was not first pushed through this tool, so its history cannot be rewritten; ask the human"
                     ));
                 };
-                if let Some(why) = still_own(&mirror, branch, last_pushed.as_deref(), old)? {
+                if let Some(why) = still_own(&mirror, entry, branch, last_pushed.as_deref(), old)? {
                     return refuse(format!("{branch} on GitHub ({}) {why}", sha12(old)));
                 }
                 // Guards against accidents only: the caller reports what it last saw.
@@ -224,9 +236,19 @@ impl GitHub {
                 text
             }
             Some(old) => {
-                // Without this record a later force=true is refused, which is the safe side.
                 let mut text = format!("updated {branch} {} -> {}", sha12(old), sha12(&new));
-                if let Err(e) = db.record_push(entry.resource_id, branch, &new) {
+                // The record follows the branch only while it is the broker's: pushing onto
+                // a branch that someone else made anew does not make it rewritable. Whatever
+                // goes wrong here leaves the record as it is, which is the safe side.
+                let own = forced.is_some()
+                    || match db.created_branch(entry.resource_id, branch) {
+                        // Recorded before the broker kept what it pushed: start now.
+                        Ok(Some(None)) => true,
+                        Ok(Some(last)) => still_own(&mirror, entry, branch, last.as_deref(), old)
+                            .is_ok_and(|why| why.is_none()),
+                        _ => false,
+                    };
+                if own && let Err(e) = db.record_push(entry.resource_id, branch, &new) {
                     log(&format!("cannot record the push to {branch}: {e}"), Some(&entry.token));
                     text.push_str(" (but force=true will not work for it until its next push: recording this one failed)");
                 }

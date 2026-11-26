@@ -80,7 +80,9 @@ pub const AGENT_MARK: &str = "[Written by an agent]";
 /// The text of a comment as it is posted.
 pub fn marked(args: &Args) -> Result<String> {
     let body = str_arg(args, "body").unwrap_or_default();
-    let written = body.trim_start().strip_prefix(AGENT_MARK);
+    // Only the mark as the broker writes it counts as there already: at the very start and
+    // alone on its line. Anything else could make Markdown swallow it.
+    let written = body.strip_prefix(AGENT_MARK).filter(|rest| rest.is_empty() || rest.starts_with('\n'));
     // GitHub refuses an empty comment; with the mark in front it would not see one.
     if written.unwrap_or(body).trim().is_empty() {
         return refuse("the comment has no text");
@@ -133,7 +135,7 @@ pub fn list(api: &Api, args: &Args) -> Result<String> {
         .items
         .iter()
         // A fork may have a branch of the same name.
-        .filter(|pr| text(&pr["head"]["repo"]["full_name"]) == api.entry.full_name)
+        .filter(|pr| super::rules::same_repo(pr))
         .filter(|pr| text(&pr["head"]["ref"]).starts_with(prefix.as_str()))
         .map(|pr| {
             let draft = pr["draft"].as_bool() == Some(true);

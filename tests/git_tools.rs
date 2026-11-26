@@ -81,12 +81,15 @@ fn force_is_lost_when_someone_else_makes_the_branch_anew() {
     let (text, is_error) = force_after_fetch(&w, &dir);
     assert!(is_error && text.contains(refused), "{text}");
     assert_eq!(w.hub_ref("o/a", "daniel/x"), Some(theirs.clone()));
-    // Building on it is fine, and makes the branch the agent's to rewrite again.
+    // Building on it is fine, but does not make it the agent's to rewrite.
     git(&dir, &["reset", "-q", "--hard", "origin/daniel/x"]);
-    w.commit(&dir, "on top");
+    let on_top = w.commit(&dir, "on top");
     assert!(!w.push(&dir, false).1);
-    git(&dir, &["commit", "-q", "--amend", "-m", "on top, reworded"]);
-    assert!(!w.push(&dir, true).1);
+    git(&dir, &["reset", "-q", "--hard", "origin/main"]);
+    w.commit(&dir, "rewrite without their work");
+    let (text, is_error) = w.push(&dir, true);
+    assert!(is_error && text.contains(refused), "{text}");
+    assert_eq!(w.hub_ref("o/a", "daniel/x"), Some(on_top));
 
     // Merged, deleted, then created again from where it was merged to, with new work. That
     // may be any branch, and the default branch may have another name by now.
@@ -123,6 +126,26 @@ fn a_merged_branch_that_nobody_touched_is_still_the_agents() {
     let (text, is_error) = w.push(&dir, true);
     assert!(!is_error, "{text}");
     assert_eq!(w.hub_ref("o/a", "main"), Some(one));
+}
+
+#[test]
+fn another_agent_branch_with_the_same_commits_is_no_merge() {
+    // The agent stacks a second branch on the first, then a human brings main into the first.
+    let w = World::new();
+    let dir = w.clone("work");
+    w.commit(&dir, "one");
+    assert!(!w.push(&dir, false).1);
+    git(&dir, &["branch", "daniel/y"]);
+    let stacked = json!({"workspace": dir, "branch": "daniel/y"});
+    w.ok("github_push", stacked);
+    let human = human_clone(&w, "human", "daniel/x");
+    w.commit(&human, "by the human");
+    git(&human, &["push", "-q", "origin", "daniel/x"]);
+    w.ok("github_fetch", json!({"workspace": dir, "branch": "daniel/x"}));
+    git(&dir, &["reset", "-q", "--hard", "origin/daniel/x"]);
+    git(&dir, &["commit", "-q", "--amend", "-m", "by the human, reworded"]);
+    let (text, is_error) = w.push(&dir, true);
+    assert!(!is_error, "{text}");
 }
 
 #[test]

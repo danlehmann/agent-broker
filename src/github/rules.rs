@@ -47,8 +47,15 @@ pub fn check_repo_name(name: &str) -> Result<()> {
 
 /// Whether a PR comes from a branch with the entry's prefix in this very repo. The head repo
 /// is absent when a fork was deleted.
+/// Whether the PR's branch is in the repo itself, not in a fork. By id: after a rename
+/// GitHub answers under the new name, which the stored one would not match.
+pub fn same_repo(pr: &Value) -> bool {
+    let id = pr["head"]["repo"]["id"].as_i64();
+    id.is_some() && id == pr["base"]["repo"]["id"].as_i64()
+}
+
 pub fn check_own_pr(pr: &Value, number: i64, entry: &RepoEntry) -> Result<()> {
-    let same_repo = pr["head"]["repo"]["full_name"].as_str() == Some(&entry.full_name);
+    let same_repo = same_repo(pr);
     let own_branch = !entry.branch_prefix.is_empty()
         && pr["head"]["ref"].as_str().is_some_and(|r| r.starts_with(&entry.branch_prefix));
     if same_repo && own_branch {
@@ -138,14 +145,18 @@ mod tests {
     #[test]
     fn own_pr() {
         let e = test_entry();
-        let pr = |repo: Value, r: &str| json!({"head": {"repo": repo, "ref": r}});
+        let pr = |repo: Value, r: &str| json!({"head": {"repo": repo, "ref": r}, "base": {"repo": {"id": 1, "full_name": "o/r"}}});
         let check = |pr: &Value| check_own_pr(pr, 7, &e).map_err(|x| x.public().to_string());
-        assert!(check(&pr(json!({"full_name": "o/r"}), "daniel/x")).is_ok());
+        assert!(check(&pr(json!({"id": 1, "full_name": "o/r"}), "daniel/x")).is_ok());
+        // The repo was renamed since the entry was made.
+        assert!(check(&pr(json!({"id": 1, "full_name": "o/new"}), "daniel/x")).is_ok());
         for bad in [
-            pr(json!({"full_name": "evil/r"}), "daniel/x"),
+            pr(json!({"id": 2, "full_name": "evil/r"}), "daniel/x"),
+            pr(json!({"full_name": "o/r"}), "daniel/x"),
             pr(Value::Null, "daniel/x"),
-            pr(json!({"full_name": "o/r"}), "main"),
-            pr(json!({"full_name": "o/r"}), "xdaniel/x"),
+            json!({"head": {"repo": {}, "ref": "daniel/x"}, "base": {}}),
+            pr(json!({"id": 1, "full_name": "o/r"}), "main"),
+            pr(json!({"id": 1, "full_name": "o/r"}), "xdaniel/x"),
             json!({}),
             Value::Null,
         ] {

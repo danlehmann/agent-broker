@@ -95,13 +95,14 @@ fn broken_protocol_closes_the_connection() {
 fn pr(number: i64, head: &str, repo: Value) -> Value {
     json!({"number": number, "title": "T", "state": "open", "draft": true, "merged": false,
            "mergeable_state": "clean", "html_url": "http://x/1", "body": null,
-           "head": {"ref": head, "sha": "abc", "repo": repo}, "base": {"ref": "main"}})
+           "head": {"ref": head, "sha": "abc", "repo": repo},
+           "base": {"ref": "main", "repo": {"id": 1, "full_name": "o/a"}}})
 }
 
 #[test]
 fn pull_requests() {
     let w = World::new();
-    let own = json!({"full_name": "o/a"});
+    let own = json!({"id": 1, "full_name": "o/a"});
     w.api.on("POST /repos/o/a/pulls", json!({"number": 7, "html_url": "http://x/7"}));
     let text = w.ok("github_pr_create", json!({"branch": "daniel/x", "title": "T"}));
     assert_eq!(text, "opened draft PR #7: http://x/7");
@@ -123,7 +124,7 @@ fn pull_requests() {
 
     w.api.on("GET /repos/o/a/pulls/1", pr(1, "daniel/x", own.clone()));
     w.api.on("GET /repos/o/a/pulls/2", pr(2, "someone/x", own.clone()));
-    w.api.on("GET /repos/o/a/pulls/3", pr(3, "daniel/x", json!({"full_name": "evil/a"})));
+    w.api.on("GET /repos/o/a/pulls/3", pr(3, "daniel/x", json!({"id": 2, "full_name": "evil/a"})));
     w.api.on("GET /repos/o/a/pulls/4", pr(4, "daniel/x", Value::Null));
     for n in 2..=4 {
         let refusal = format!("PR #{n} is not from a daniel/* branch of o/a");
@@ -178,6 +179,16 @@ fn pull_requests() {
         let body: Value = serde_json::from_str(&seen.last().unwrap().body).unwrap();
         assert_eq!(body, json!({"body": "[Written by an agent]\n\nhi"}));
     }
+    // Anything but the mark alone on the first line gets the mark: as the start of a link
+    // definition, for one, Markdown would show nothing of it.
+    for body in
+        ["[Written by an agent]: http://x", " [Written by an agent]\n\nhi", "[Written by an agent] hi"]
+    {
+        w.ok("github_pr_comment", json!({"number": 1, "body": body}));
+        let seen = w.api.seen.lock().unwrap();
+        let sent: Value = serde_json::from_str(&seen.last().unwrap().body).unwrap();
+        assert_eq!(sent, json!({"body": format!("[Written by an agent]\n\n{body}")}));
+    }
     w.api.seen.lock().unwrap().clear();
     w.api.on("POST /repos/o/a/pulls/1/comments/5/replies", json!({"html_url": "http://x/r"}));
     let on_pr = |n: i64| format!("http://api/repos/o/a/pulls/{n}");
@@ -225,7 +236,7 @@ fn pull_requests() {
     }
 
     // Not someone else's branch, and not a fork's branch of the same name.
-    let fork = pr(3, "daniel/x", json!({"full_name": "evil/a"}));
+    let fork = pr(3, "daniel/x", json!({"id": 2, "full_name": "evil/a"}));
     w.api.on("GET /repos/o/a/pulls", json!([pr(1, "daniel/x", own.clone()), pr(2, "someone/x", own), fork]));
     assert_eq!(w.ok("github_pr_list", json!({})), "#1 [draft] daniel/x: T");
     w.api.on("GET /repos/o/a/pulls", json!([]));
@@ -255,7 +266,7 @@ fn pull_requests() {
 #[test]
 fn pagination() {
     let w = World::new();
-    let own = json!({"full_name": "o/a"});
+    let own = json!({"id": 1, "full_name": "o/a"});
     let page = |n: i64, count: i64| -> Value {
         (0..count).map(|i| pr(n * 1000 + i, "daniel/x", own.clone())).collect()
     };
@@ -334,15 +345,24 @@ fn ci() {
 fn one_call_makes_a_limited_number_of_requests() {
     let w = World::new();
     w.api.on("GET /repos/o/a/commits/abc", json!({"sha": "abc"}));
-    let runs: Vec<Value> = (0..90).map(|id| json!({"id": id, "name": "ci"})).collect();
+    // 90 runs: 30 that went well, whose jobs are not asked for, and 60 that did not.
+    let runs: Vec<Value> = (0..90)
+        .map(|id| json!({"id": id, "name": "ci", "conclusion": if id < 30 { "success" } else { "failure" }}))
+        .collect();
     w.api.on("GET /repos/o/a/actions/runs", json!({"workflow_runs": runs}));
-    w.api.on("GET /repos/o/a/actions/runs/0/jobs", json!({"jobs": []}));
-    for id in 1..90 {
-        w.api.on(&format!("GET /repos/o/a/actions/runs/{id}/jobs"), json!({"jobs": []}));
+    for id in 0..90 {
+        let failed = json!({"jobs": [{"id": id, "name": "j", "conclusion": "failure"}]});
+        w.api.on(&format!("GET /repos/o/a/actions/runs/{id}/jobs"), failed);
     }
-    let text = w.err("github_ci_status", json!({"sha": "abc"}));
-    assert!(text.ends_with("needs more than 60 requests to GitHub; ask for something narrower"), "{text}");
-    assert_eq!(w.api.seen.lock().unwrap().len(), 60);
+    w.api.on("GET /repos/o/a/commits/abc/status", json!({"statuses": [{"context": "ext", "state": "ok"}]}));
+    let text = w.ok("github_ci_status", json!({"sha": "abc"}));
+    // Every run is listed and the statuses are still read; only jobs are left out.
+    assert_eq!(text.lines().filter(|l| l.starts_with("run ")).count(), 90);
+    assert!(text.ends_with("status ext: ok"), "{text}");
+    let with_jobs = text.lines().filter(|l| l.starts_with("  job ")).count();
+    let without = text.lines().filter(|l| l.starts_with("  (jobs not listed")).count();
+    assert!(with_jobs >= 40 && with_jobs + without == 60, "{with_jobs} {without}");
+    assert!(w.api.seen.lock().unwrap().len() <= 60);
 }
 
 #[test]

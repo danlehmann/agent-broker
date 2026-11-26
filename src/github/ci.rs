@@ -6,6 +6,9 @@ use super::api::{Api, MAX_ITEMS, text};
 use crate::error::{Result, refuse};
 use crate::spec::{Args, int_arg, str_arg};
 
+/// Requests kept back for the jobs of one run (a list of several pages) and the statuses.
+const JOBS_RESERVE: u32 = 8;
+
 pub fn status(api: &Api, args: &Args) -> Result<String> {
     let sha = match int_arg(args, "pr") {
         Some(pr) => text(&api.get(&format!("/pulls/{pr}"), &[])?["head"]["sha"]).to_string(),
@@ -32,6 +35,15 @@ pub fn status(api: &Api, args: &Args) -> Result<String> {
             text(&run["conclusion"]),
             text(&run["html_url"])
         ));
+        // The jobs matter where something is unfinished or went wrong. A commit can have
+        // more runs than one call may ask about; what is left over is said, not refused.
+        if matches!(text(&run["conclusion"]), "success" | "skipped") {
+            continue;
+        }
+        if api.requests_left() < JOBS_RESERVE {
+            out.push("  (jobs not listed: this call has used up its requests to GitHub; give the run's failed job id to github_ci_logs, or see the run's page)".into());
+            continue;
+        }
         let path = format!("/actions/runs/{}/jobs", run["id"]);
         let jobs = api.paged(&path, &[("filter", "latest")], Some("jobs"))?;
         out.extend(more(jobs.cut, "jobs of this run").map(|note| format!("  {note}")));
