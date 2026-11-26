@@ -126,8 +126,8 @@ pub fn run(options: &Options) -> Fatal {
     if let Some(link) = web.first_run_link().map_err(|e| e.to_string())? {
         log(
             &format!(
-                "there is no user yet. {}\nThen open this link to create the first admin. It works \
-                 once, and a restart replaces it:\n\n    http://localhost:8443{link}\n",
+                "nobody can log in as an admin yet. {}\nThen open this link to create the first \
+                 admin. It works once, and a restart replaces it:\n\n    http://localhost:8443{link}\n",
                 how_to_reach(&admin)
             ),
             None,

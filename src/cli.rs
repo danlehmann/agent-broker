@@ -129,8 +129,9 @@ fn reset_login(flags: &Flags, username: &str) -> Outcome {
     let entry = AuditEntry {
         event: "reset link made",
         uid: Some(nix::unistd::getuid().as_raw()),
+        username: Some(username),
         ok: Some(true),
-        detail: &format!("for {username}, on the command line"),
+        detail: "on the command line",
         ..Default::default()
     };
     db.audit(&entry).map_err(fail)?;

@@ -124,14 +124,39 @@ impl Db {
             .flatten())
     }
 
-    /// Creates a user who can log in at once.
-    pub fn add_user_with_password(&self, username: &str, is_admin: bool, hash: &str) -> Result<i64> {
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO users (username, is_admin, password_hash) VALUES (?1, ?2, ?3)",
-            params![username, is_admin, hash],
+    /// Whether anyone can log in and manage users.
+    pub fn has_working_admin(&self) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM users WHERE is_admin AND NOT disabled AND password_hash IS NOT NULL)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Makes `username` an admin who can log in, creating the user if there is none of that
+    /// name. Only while nobody can log in and manage users; `false` if somebody can.
+    pub fn make_first_admin(&self, username: &str, hash: &str) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let working: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM users WHERE is_admin AND NOT disabled AND password_hash IS NOT NULL)",
+            [],
+            |r| r.get(0),
         )?;
-        Ok(conn.last_insert_rowid())
+        if working {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO users (username, is_admin, password_hash) VALUES (?1, 1, ?2)
+             ON CONFLICT (username) DO UPDATE SET is_admin = 1, disabled = 0, password_hash = ?2",
+            params![username, hash],
+        )?;
+        tx.execute(
+            "DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = ?1)",
+            [username],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Sets the password and ends every session of the user but `keep`.

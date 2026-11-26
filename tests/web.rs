@@ -144,10 +144,7 @@ fn a_password_is_set_through_a_link_that_works_once() {
     assert!(short.body.contains("at least 12 characters"));
     // Neither of these used the link up.
     let resp = s.request("POST", &link, "", &[("new", PASSWORD), ("again", PASSWORD)]);
-    assert_eq!(
-        (resp.status, resp.location.as_deref()),
-        (303, Some("/?ok=Password%20set.%20Log%20in%20with%20it."))
-    );
+    assert_eq!((resp.status, resp.location.as_deref()), (303, Some("/?ok=password")));
     assert_eq!(s.request("GET", &link, "", &[]).status, 404);
     assert_eq!(
         s.request("POST", &link, "", &[("new", "another password"), ("again", "another password")]).status,
@@ -247,8 +244,21 @@ fn rules_are_held_against_what_is_stored_at_that_moment() {
 #[test]
 fn a_fresh_install_is_set_up_through_the_link_the_daemon_prints() {
     let s = Site::new();
-    // With users around there is no such link.
+    // A database whose users never got a password: nobody can log in, so there is a link, and
+    // it can make one of those users the admin. What is theirs stays.
+    let link = s.web.first_run_link().unwrap().unwrap();
+    let form = [("username", "bob"), ("new", PASSWORD), ("again", PASSWORD)];
+    let resp = s.request("POST", &link, "", &form);
+    assert_eq!((resp.status, resp.location.as_deref()), (303, Some("/?ok=admin")));
+    let bob = s.login("bob", PASSWORD);
+    assert_eq!(s.get(&bob, "users").status, 200);
+    assert!(s.get(&bob, "repos").body.contains("o/b"));
+    // With an admin who can log in there is no such link, and the old one is over.
     assert_eq!(s.web.first_run_link().unwrap(), None);
+    assert_eq!(s.request("POST", &link, "", &form).status, 404);
+    // The login page only shows notices of its own.
+    assert!(s.request("GET", "/?ok=admin", "", &[]).body.contains("You are the first admin."));
+    assert!(!s.request("GET", "/?ok=Call%20this%20number", "", &[]).body.contains("Call this number"));
     s.w.broker.db.conn().execute("DELETE FROM users", []).unwrap();
     let old = s.web.first_run_link().unwrap().unwrap();
     let link = s.web.first_run_link().unwrap().unwrap();
@@ -256,7 +266,7 @@ fn a_fresh_install_is_set_up_through_the_link_the_daemon_prints() {
     assert_eq!(s.request("GET", &old, "", &[]).status, 404);
     assert_eq!(s.request("GET", "/setup/", "", &[]).status, 404);
     let page = s.request("GET", &link, "", &[]).body;
-    assert!(page.contains("There is no user yet") && page.contains("name=\"username\""));
+    assert!(page.contains("Nobody can log in as an admin yet") && page.contains("name=\"username\""));
     let create = |name: &str, new: &str, again: &str| {
         s.request("POST", &link, "", &[("username", name), ("new", new), ("again", again)])
     };
@@ -742,6 +752,9 @@ fn admins_manage_users_but_one_admin_always_remains() {
     // A reset link lets the admin hand the account back, without learning the password.
     let page = s.post(&alice, &format!("users/{}/reset", id("bob")), &[]).body;
     assert!(page.contains("One-time link for bob"));
+    let rows = db.audit_rows().unwrap();
+    let made = rows.iter().find(|r| r["event"] == "reset link made").unwrap();
+    assert_eq!((made["username"].as_str(), made["detail"].as_str()), (Some("bob"), Some("by alice")));
     // Deleting takes the user's tokens, repos, links and mirrors along.
     let repo = s.repo_id("bob", "o/b");
     let mirror = s.w.dir.path().join(format!("data/mirrors/{repo}.git"));

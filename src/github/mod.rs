@@ -9,7 +9,7 @@ mod pulls;
 mod push;
 pub mod rules;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -139,6 +139,9 @@ pub struct GitHub {
     tmp: PathBuf,
     /// Serialises work in each mirror.
     locks: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
+    /// Entries deleted while this process runs. A call that was let in just before still has
+    /// its copy of the entry, and must not set up the mirror again.
+    forgotten: Mutex<HashSet<i64>>,
 }
 
 /// What a tool produced.
@@ -164,14 +167,23 @@ impl GitHub {
             mirrors: data_dir.join("mirrors"),
             tmp: data_dir.join("tmp"),
             locks: Mutex::default(),
+            forgotten: Mutex::default(),
         }
     }
 
     /// Removes what is kept for a repo entry that is gone.
-    pub fn forget(&self, resource_id: i64) {
+    pub fn forget(&self, resource_id: i64) -> std::io::Result<()> {
         let lock = self.lock(resource_id);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = std::fs::remove_dir_all(self.mirrors.join(format!("{resource_id}.git")));
+        self.forgotten.lock().unwrap_or_else(|e| e.into_inner()).insert(resource_id);
+        match std::fs::remove_dir_all(self.mirrors.join(format!("{resource_id}.git"))) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    fn is_forgotten(&self, resource_id: i64) -> bool {
+        self.forgotten.lock().unwrap_or_else(|e| e.into_inner()).contains(&resource_id)
     }
 
     pub fn tmp(&self) -> &std::path::Path {
@@ -217,7 +229,12 @@ impl GitHub {
             token: token.into(),
         };
         let repo = self.api(&entry).get("", &[])?;
-        Ok((api::text(&repo["full_name"]).into(), api::text(&repo["default_branch"]).into()))
+        let (name, default_branch) = (api::text(&repo["full_name"]), api::text(&repo["default_branch"]));
+        // The rules are checked against both, so an answer without them is no answer.
+        if name.is_empty() || default_branch.is_empty() {
+            return refuse("GitHub's answer did not name the repo and its default branch");
+        }
+        Ok((name.into(), default_branch.into()))
     }
 }
 

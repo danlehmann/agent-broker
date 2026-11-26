@@ -299,7 +299,11 @@ impl Raw {
 
     pub fn read(&mut self) -> Value {
         let mut line = String::new();
-        self.0.read_line(&mut line).unwrap();
+        // A connection the broker closed while bytes were still on their way to it ends with a
+        // reset and not with an end of file. Both are "closed".
+        if self.0.read_line(&mut line).is_err() {
+            return Value::Null;
+        }
         serde_json::from_str(&line).unwrap_or(Value::Null)
     }
 

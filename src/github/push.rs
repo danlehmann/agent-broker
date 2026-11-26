@@ -168,6 +168,8 @@ impl GitHub {
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mirror = self.mirror(entry)?;
         let branch = &push.branch;
+        // Asked again: the default branch may have been changed since the first step.
+        remote_tip(&mirror, branch)?;
         let staging = TempRef { mirror: &mirror, name: format!("refs/staging/{call_id}") };
 
         match bundle {

@@ -393,7 +393,8 @@ pub fn setup(token: &str, user: Option<&str>, err: Option<(&str, &str)>) -> Stri
         None => (
             "Set up agent-broker".to_string(),
             format!(
-                "<p>There is no user yet. The one you create here is the first admin.</p>\
+                "<p>Nobody can log in as an admin yet. The user you name here becomes the first admin; \
+                 a user of that name that exists already keeps what is theirs.</p>\
                  <label>Username</label><input type=\"text\" name=\"username\" value=\"{}\" required autofocus>",
                 esc(err.map_or("", |(typed, _)| typed))
             ),

@@ -32,6 +32,10 @@ pub struct Mirror<'a> {
 impl GitHub {
     /// Opens the entry's mirror, creating it on first use. Hold the entry's lock.
     pub(super) fn mirror<'a>(&'a self, entry: &'a RepoEntry) -> Result<Mirror<'a>> {
+        // Callers hold the entry's lock, as `forget` does.
+        if self.is_forgotten(entry.resource_id) {
+            return refuse("this repo entry was deleted");
+        }
         let path = self.mirrors.join(format!("{}.git", entry.resource_id));
         let mirror = Mirror { gh: self, entry, path };
         // The remote is set last, so its presence means that setup finished.

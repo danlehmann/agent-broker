@@ -136,11 +136,12 @@ impl Web {
         }
     }
 
-    /// While there is no user at all: a new link path where the first admin is created. Anyone
-    /// on the machine can reach the web UI, so only who can read this may set it up. The link
-    /// works once, and until this is called again.
+    /// While nobody can log in and manage users: a new link path where the first admin is
+    /// created. That is a fresh install, and also a database whose users never got a password.
+    /// Anyone on the machine can reach the web UI, so only who can read this may set it up.
+    /// The link works once, and until this is called again.
     pub fn first_run_link(&self) -> Result<Option<String>> {
-        if !self.broker.db.users()?.is_empty() {
+        if self.broker.db.has_working_admin()? {
             return Ok(None);
         }
         let token = random_base32(52);
@@ -157,7 +158,7 @@ impl Web {
             return Ok(None);
         }
         let db = &self.broker.db;
-        if !db.users()?.is_empty() {
+        if db.has_working_admin()? {
             *first_run = None;
             return Ok(None);
         }
@@ -175,11 +176,13 @@ impl Web {
             return Ok(Some(Resp::page(pages::setup(token, None, Some((name, &problem))))));
         }
         let hash = hash_password(new, self.cost).ok_or_else(|| Error::Internal("hashing failed".into()))?;
-        db.add_user_with_password(name, true, &hash)?;
+        let made = db.make_first_admin(name, &hash)?;
         *first_run = None;
+        if !made {
+            return Ok(None);
+        }
         self.audit(req.peer, Some(name), "first admin created", true, None, "");
-        let done = "You are the first admin. Log in with the name and password you chose.";
-        Ok(Some(Resp::redirect(format!("/?ok={}", http::encode(done)))))
+        Ok(Some(Resp::redirect("/?ok=admin".into())))
     }
 
     /// Answers one request. Failures inside become a plain error page.
@@ -217,7 +220,17 @@ impl Web {
             return self.behind_login(req, secret, rest);
         }
         match (post, path) {
-            (false, "/") => Ok(Resp::page(pages::login(field(&req.query, "ok"), None))),
+            // The notice is one of ours: a link must not be able to put words on this page.
+            (false, "/") => {
+                let ok = match field(&req.query, "ok") {
+                    Some("admin") => {
+                        Some("You are the first admin. Log in with the name and password you chose.")
+                    }
+                    Some("password") => Some("Password set. Log in with it."),
+                    _ => None,
+                };
+                Ok(Resp::page(pages::login(ok, None)))
+            }
             (true, "/login") => self.login(req),
             (_, p) if p.starts_with("/setup/") => self.setup(req, &p["/setup/".len()..]),
             _ => Ok(Resp::error(404, "no such page")),
@@ -319,7 +332,7 @@ impl Web {
             return Ok(Resp::error(404, "This link is used up or too old. Ask for a new one."));
         }
         self.audit(req.peer, Some(&user.username), "password set through a link", true, None, "");
-        Ok(Resp::redirect(format!("/?ok={}", http::encode("Password set. Log in with it."))))
+        Ok(Resp::redirect("/?ok=password".into()))
     }
 
     fn behind_login(&self, req: &Req, secret: &str, rest: &str) -> Result<Resp> {
@@ -584,6 +597,21 @@ impl Web {
         Ok(resp)
     }
 
+    /// Removes the copies of deleted entries' repos. What to tell if some could not be removed.
+    fn forget(&self, ids: &[i64]) -> String {
+        let mut failed = 0;
+        for id in ids {
+            if let Err(e) = self.broker.github.forget(*id) {
+                log(&format!("cannot remove the mirror of deleted repo entry {id}: {e}"), None);
+                failed += 1;
+            }
+        }
+        match failed {
+            0 => String::new(),
+            _ => " A copy of the repo's commits could not be removed from the broker's disk; see the daemon's log.".into(),
+        }
+    }
+
     fn change_repo(&self, ctx: &Ctx, id: i64, action: &str) -> Result<Resp> {
         let db = &self.broker.db;
         let user = ctx.user();
@@ -602,9 +630,9 @@ impl Web {
             "check" => return self.check_repo(ctx, id, None),
             "delete" => {
                 db.delete_repo(user.id, id)?;
-                self.broker.github.forget(id);
-                self.note(ctx, "repo deleted", true, Some(name), "");
-                format!("Deleted the entry for {name}, with its token.")
+                let left = self.forget(&[id]);
+                self.note(ctx, "repo deleted", true, Some(name), &left);
+                format!("Deleted the entry for {name}, with its token.{left}")
             }
             _ => return Ok(Resp::error(404, "no such action")),
         };
@@ -682,7 +710,9 @@ impl Web {
         let name = target.username.as_str();
         if action == "reset" {
             let token = db.new_one_time_link(id, "reset")?;
-            self.note(ctx, "reset link made", true, None, name);
+            // Under the name of whose password it is, so that they find it in their own log.
+            let detail = format!("by {}", ctx.user().username);
+            self.audit(ctx.req.peer, Some(name), "reset link made", true, None, &detail);
             let url = self.link_url(ctx, &token);
             return Ok(Resp::page(ctx.frame().users(&db.users()?, Some((name, &url)))));
         }
@@ -704,11 +734,9 @@ impl Web {
         };
         let mirrors = if action == "delete" { db.resource_ids(id)? } else { vec![] };
         db.change_user(id, change)?;
-        for mirror in mirrors {
-            self.broker.github.forget(mirror);
-        }
-        self.note(ctx, &format!("user {action}"), true, None, name);
-        Ok(ctx.done("users", &text))
+        let left = self.forget(&mirrors);
+        self.note(ctx, &format!("user {action}"), true, None, &format!("{name}{left}"));
+        Ok(ctx.done("users", &format!("{text}{left}")))
     }
 }
 
